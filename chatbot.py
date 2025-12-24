@@ -7,13 +7,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import uuid
 import re
+from google import genai
+
+# === [AI 설정] Gemini API 연결 ===
+GEMINI_API_KEY = "AIzaSyD_4GxoAS9nL-YaOJ-Fb2ZYNhRx7y_uUAA"  # 제공해주신 키 적용
+client = genai.Client(api_key=GEMINI_API_KEY)  # <--- Client 객체 생성 방식으로 변경
 
 # === 페이지 설정 (가장 먼저 실행되어야 함) ===
 st.set_page_config(
-    page_title="유연학사제도(다전공) 안내 챗봇",
+    page_title="한경국립대 다전공 안내 챗봇",
     page_icon="🎓",
     layout="wide",
-    initial_sidebar_state="collapsed"
 )
 
 # === 자동 스크롤 함수 (마지막 말풍선 추적 방식 + Focus) ===
@@ -263,6 +267,261 @@ KEYWORDS_DATA = load_keywords()
 GRAD_REQUIREMENTS = load_graduation_requirements()
 PRIMARY_REQUIREMENTS = load_primary_requirements()
 MAJORS_INFO = load_majors_info()  # 🆕 전공 정보 로드
+
+
+# === [핵심] AI 지식 검색 함수 (RAG) ===
+def get_ai_context(user_input):
+    context = ""
+    user_input_clean = user_input.replace(" ", "").lower()
+
+    # 1. 어떤 다전공 제도에 관심이 있는지 파악 (복수, 부, 융합 등)
+    target_program = None
+    for p in ["복수전공", "부전공", "융합전공", "융합부전공", "연계전공", "마이크로디그리"]:
+        if p in user_input_clean or p[:2] in user_input_clean:
+            target_program = p
+            break
+
+    # 2. 본전공 이수요건 변동 정보 검색 (PRIMARY_REQUIREMENTS 활용)
+    if not PRIMARY_REQUIREMENTS.empty:
+        # 전공 핵심어 추출 (예: 경영학전공 -> 경영)
+        root_input = re.sub(r'(전공|학과|학부|의|신청|학점|어떻게|변해|알려줘|추천)', '', user_input_clean)
+        
+        # 전공명 매칭
+        matched_primary = []
+        for m in PRIMARY_REQUIREMENTS['전공명'].unique():
+            if root_input in str(m).lower() or str(m).lower().replace("전공","") in root_input:
+                matched_primary.append(m)
+        
+        if matched_primary:
+            for m in matched_primary[:1]: # 가장 유사한 전공 하나 선택
+                df_major = PRIMARY_REQUIREMENTS[PRIMARY_REQUIREMENTS['전공명'] == m]
+                
+                # [중요] 해당 전공의 모든 이수 요건(단일전공 포함)을 다 AI에게 줍니다.
+                # 그래야 AI가 '단일전공'과 '복수전공'을 비교해서 설명할 수 있습니다.
+                context += f"### [{m}] 본전공 이수학점 상세 기준\n"
+                for _, row in df_major.iterrows():
+                    context += f"- 구분: {row['구분']}\n"
+                    context += f"  * 본전공 전필: {row.get('본전공_전필', 0)}학점\n"
+                    context += f"  * 본전공 전선: {row.get('본전공_전선', 0)}학점\n"
+                    context += f"  * 본전공 총합: {row.get('본전공_계', 0)}학점\n"
+                context += "\n"
+
+    # 1. 제도 카테고리 감지 (리스트를 뽑기 위한 키워드)
+    # 사용자가 '융합전공 종류', '마디 리스트' 등을 물어볼 때 대응
+    categories = {
+        "융합전공": ["융합전공", "융합"],
+        "부전공": ["부전공"],
+        "복수전공": ["복수전공", "복전"],
+        "마이크로디그리": ["마이크로디그리", "마디", "소단위", "md"],
+        "연계전공": ["연계전공", "연계"]
+    }
+
+    target_category = None
+    for cat_name, keywords in categories.items():
+        if any(kw in user_input_clean for kw in keywords):
+            target_category = cat_name
+            # 사용자가 리스트를 원할 경우를 대비해 해당 카테고리 전체를 긁어옴
+            if not MAJORS_INFO.empty and '제도유형' in MAJORS_INFO.columns:
+                # '제도유형' 컬럼에 해당 카테고리명이 포함된 전공들 추출
+                matched_rows = MAJORS_INFO[MAJORS_INFO['제도유형'].str.contains(cat_name, na=False)]
+                if not matched_rows.empty:
+                    major_list = matched_rows['전공명'].tolist()
+                    context += f"[{cat_name} 전체 목록]\n- 현재 운영 중인 전공: {', '.join(major_list)}\n"
+                    context += "(이 리스트를 학생에게 모두 나열하며 안내해주세요.)\n\n"
+
+    # [의도 파악용 키워드]
+    is_contact_query = any(w in user_input_clean for w in ["연락처", "사무실", "위치", "번호"])
+    is_major_list_query = any(w in user_input_clean for w in ["전공", "종류", "리스트", "뭐있어"])
+    is_apply_query = any(w in user_input_clean for w in ["신청", "기간", "절차", "방법", "언제"])
+    
+    # 1. 특정 전공 매칭 시도
+    root_input = re.sub(r'(전공|학과|학부|의|과목|학년|리스트|추천|해줘|알려줘|뭐있어|설명|연락처|위치|사무실)', '', user_input_clean)
+
+    if len(root_input) >= 2: # 최소 2글자 이상일 때만 상세 검색
+        matched_majors = set()
+        if not MAJORS_INFO.empty:
+           for m in MAJORS_INFO['전공명'].unique():
+                if root_input in str(m).lower() or str(m).lower().replace("전공","") in root_input:
+                    matched_majors.add(str(m))
+       
+    for major in list(matched_majors)[:2]:
+            m_info = MAJORS_INFO[MAJORS_INFO['전공명'] == major]
+            if not m_info.empty:
+                row = m_info.iloc[0]
+                context += f"[{major} 상세정보]\n- 연락처: {row.get('연락처','-')}\n- 위치: {row.get('위치','-')}\n- 소개: {row.get('전공설명','-')}\n\n"
+
+    # 2. 데이터 수집
+    if matched_majors:
+        # 특정 전공이 매칭된 경우 (상세 정보 제공)
+        for major in list(matched_majors)[:2]:
+            m_info = MAJORS_INFO[MAJORS_INFO['전공명'] == major]
+            if not m_info.empty:
+                row = m_info.iloc[0]
+                context += f"[{major} 정보]\n- 연락처: {row.get('연락처','-')}\n- 위치: {row.get('위치','-')}\n- 소개: {row.get('전공설명','-')}\n\n"
+    
+    # [핵심 수정] 특정 전공이 없어도 범용 질문이면 '맛보기' 데이터 주입
+    elif is_contact_query:
+        context += "[주요 전공 연락처 맛보기]\n"
+        # 상위 5개 전공 정보를 미리 줍니다.
+        for _, row in MAJORS_INFO.head(5).iterrows():
+            context += f"- {row['전공명']}: {row.get('연락처','-')} ({row.get('위치','-')})\n"
+        context += f"\n[전체 전공 목록]: {', '.join(all_majors[:15])}... 등\n"
+
+    # 2. 학년 파악 (1~4학년)
+    target_year = None
+    for i in range(1, 5):
+        if f"{i}학년" in user_input_clean or str(i) in user_input_clean:
+            target_year = i
+            break
+    
+    # 3. 전공 매칭 로직 (중복 제거를 위해 set 사용)
+    matched_majors = set()
+    if not COURSES_DATA.empty:
+        all_majors = COURSES_DATA['전공명'].unique()
+        for m in all_majors:
+            m_str = str(m)
+            m_clean = m_str.replace(" ", "").lower()
+            m_root = re.sub(r'(전공|학과|학부)', '', m_clean)
+            
+            # 검색어가 전공명에 포함되거나, 전공 핵심어가 검색어에 포함되는 경우 매칭
+            if root_input in m_clean or m_root in root_input:
+                matched_majors.add(m_str)
+
+    # 4. 수집된 정보를 바탕으로 Context 구성
+    if matched_majors:
+        # 후보군 리스트 생성
+        context += f"[검색된 전공 후보군: {', '.join(matched_majors)}]\n\n"
+        
+        # 각 전공별 상세 정보 및 과목 추출
+        for major in list(matched_majors)[:2]: # 토큰 절약을 위해 최대 2개 전공만 상세 안내
+            # A. 전공 기본 정보 (연락처, 설명 등)
+            if not MAJORS_INFO.empty:
+                m_info = MAJORS_INFO[MAJORS_INFO['전공명'] == major]
+                if not m_info.empty:
+                    row = m_info.iloc[0]
+                    context += f"[{major} 상세 정보]\n- 소개: {row.get('전공설명','-')}\n- 연락처: {row.get('연락처','-')}\n- 위치: {row.get('위치','-')}\n"
+
+            # B. 전공 과목 정보
+            major_courses = COURSES_DATA[COURSES_DATA['전공명'] == major]
+            if target_year:
+                major_courses = major_courses[major_courses['학년'] == target_year]
+                context += f"[{major} {target_year}학년 과목 리스트]\n"
+            else:
+                context += f"[{major} 주요 과목 리스트]\n"
+            
+            # 주요 과목 15개까지만 출력
+            for _, row in major_courses.head(15).iterrows():
+                context += f"- {row['학년']}학년 {row['학기']}학기: [{row['이수구분']}] {row['과목명']} ({row['학점']}학점)\n"
+            context += "\n"
+    else:
+        # 매칭된 전공이 없을 때
+        if len(root_input) > 1:
+            context += f"[안내] 입력하신 '{root_input}'와 일치하는 전공을 찾지 못했습니다. 학생에게 정확한 전공명을 물어봐주세요.\n"
+
+    # 6. FAQ 검색 (기존 중복 방지 로직 유지)
+    if FAQ_DATA:
+        added_faqs = set()
+        # A. 사용자가 '신청'을 물어보면 '신청'이 포함된 모든 FAQ를 우선 수집
+        if is_apply_query:
+            for faq in FAQ_DATA:
+                if "신청" in str(faq['질문']) or "기간" in str(faq['질문']):
+                    context += f"[학사 안내: 신청 관련]\nQ: {faq['질문']}\nA: {faq['답변']}\n\n"
+                    added_faqs.add(faq['질문'])
+
+        # B. 일반 키워드 매칭
+        for faq in FAQ_DATA:
+            if faq['질문'] not in added_faqs:
+                if user_input_clean in str(faq['질문']).lower() or user_input_clean in str(faq['답변']).lower():
+                    context += f"[참고 FAQ]\nQ: {faq['질문']}\nA: {faq['답변']}\n\n"
+                    added_faqs.add(faq['질문'])
+
+    # 3. 제도 정보 검색 (PROGRAM_INFO)
+    for p_name, p_info in PROGRAM_INFO.items():
+        if p_name in user_input_clean:
+            context += f"### [{p_name}] 제도 자체 이수 기준\n"
+            context += f"- 설명: {p_info['description']}\n"
+            context += f"- 이 제도 이수를 위해 필요한 학점: {p_info['credits_multi']}\n\n"
+
+    return context
+
+# === [핵심] Gemini API 답변 생성 ===
+def generate_ai_response(user_input, chat_history):
+    """Gemini API를 사용하여 답변 생성"""
+    
+    # 1. 엑셀에서 관련 지식 추출
+    context = get_ai_context(user_input)
+    
+    # 2. 대화 기록 요약 (최근 3개만)
+    history_text = ""
+    for chat in chat_history[-3:]:
+        history_text += f"{chat['role']}: {chat['content']}\n"
+
+    # 3. 시스템 프롬프트 (AI의 성격과 규칙 설정)
+    prompt = f"""
+    당신은 '한경국립대학교'의 유연학사제도(다전공) 안내 전문 AI 상담원입니다.
+    질문에 대해 아래 제공된 [학사 데이터]만을 근거로 답변하세요.
+    학생이 다전공 신청에 대해 물으면, 다전공 학점뿐만 아니라 [본전공 학점 변동] 정보도 반드시 확인해서 알려주세요.
+    
+    [학사 데이터]
+    {context if context else "검색 결과 없음"}
+
+    [대화 기록]
+    {history_text}
+
+    [규칙]
+    1. 반드시 제공된 [학사 데이터]를 최우선으로 참고하여 답변하세요.
+    2. 학생이 특정 전공의 과목을 물어보거나 추천을 요청하면, 데이터에 있는 과목명을 언급하며 추천 이유를 짧게 설명하세요.
+    3. '자료가 부족하여 제공해 드리기 어렵습니다', '학사 시스템 내 별도의 페이지에서 확인하라', '홈페이지를 참고하라', '포털에서 조회하라'는 식의 무책임하거나 모호한 안내는 절대 하지 마세요.
+    4. 데이터에 없는 내용을 답변할 때는 '제가 가진 자료에는 없지만 일반적인 내용은 이렇습니다'라고 밝히고, 정확한 확인은 해당 전공 또는 학사지원팀에 문의하라고 안내하세요.
+    5. 과목 리스트, 수강해야할 과목 등 확인은 왼쪽 메뉴의 '다전공 제도 안내'에서 확인하라고 안내하세요.
+    6. 말투는 친절하고 명확하게 '습니다'체를 사용하세요.
+    7. 중요한 수치(학점 등)는 강조(**) 표시를 하세요.
+    8. 답변 끝에는 연관된 키워드(예: #복수전공 #신청기간)를 2~3개 달아주세요.
+    9. 전공명이 모호한 경우(예: '행정'만 입력): 
+       - "혹시 '행정학전공'을 찾으시는 걸까요?"와 같이 후보군 중에서 가장 가능성 높은 전공을 되물어보세요.
+       - 데이터에 검색된 후보군({context.split(']')[0] if ']' in context else ''})이 있다면 이를 리스트로 보여주세요.
+    10. 질문 가이드 제공:
+       - 답변 마지막에 항상 "💡 더 정확한 정보를 원하시면 '행정학전공 2학년 과목 알려줘'와 같이 [전공명 + 학년]을 포함하여 질문해 주세요!"라는 가이드를 넣으세요.
+    11. 과목 추천:
+       - 데이터에 과목 정보가 있다면 되묻는 동시에 "우선 찾으시는 전공일 것으로 예상되는 {context.split('[')[1].split(' ')[0] if '[' in context else '해당 전공'}의 과목을 안내해 드립니다"라며 맛보기 정보를 제공하세요.
+    12. 친절도: 학생을 대하듯 친절하고 따뜻하게 답변하세요.
+    13. 학생이 질문한 내용에 대해 데이터가 부족하다면, 질문 예시(예: 전공명과 학년을 함께 말씀해 주세요)를 참고하여 다시 질문하도록 친절하게 유도해줘.
+    14. 질문 예시(버튼)를 누른 경우처럼 질문이 조금 포괄적이더라도, "구체적으로 말해달라"는 답변부터 하지 마세요.
+    15. 데이터에 있는 정보(연락처 맛보기, 전공 리스트 등)를 활용하여 일단 아는 범위 내에서 최대한 풍부하게 답변하세요.
+    16. 연락처를 물으면 표(Table) 형식을 사용하여 깔끔하게 정리해 보여주세요.
+    17. 정보가 많아 리스트를 보여준 후에는, "더 궁금한 특정 전공이 있다면 이름을 말씀해 주세요!"라고 자연스럽게 유도하세요.
+    18. 만약 특정 전공의 신청 절차가 데이터에 없다면, 제공된 [데이터] 중 '다전공 신청'이나 '일반적인 신청 기간' 정보를 활용하여 "공통적으로 다전공 신청은 매년 4월, 10월경에 진행됩니다"와 같이 아는 범위 내에서 최대한 답변하세요.
+    19. 데이터에 신청 기간 정보가 조금이라도 있다면 그것을 최우선으로 안내하세요.
+    20. 정보가 정 부족하다면 답변 끝에 "더 상세한 개인별 상황은 학사지원팀(031-670-5035)에 문의하면 정확히 확인할 수 있습니다"라고 덧붙이세요.
+    21. 데이터에 [본전공 학점 변동 정보]가 포함되어 있다면, 이를 강조해서 안내하세요. 
+    22. 예: "행정학전공 학생이 복수전공을 신청하면, 본전공 이수 학점이 기존 70학점에서 45학점으로 줄어들어 부담이 적어집니다!"와 같은 방식으로 설명하세요.
+    23. 만약 사용자의 전공이 무엇인지 모른다면, "본전공에 따라 다전공 신청 시 본전공 이수 학점이 줄어들 수 있으니, 본전공 이름을 말씀해주시면 더 정확히 안내해 드릴게요."라고 친절히 되물으세요.
+    24. 학생이 특정 전공(예: 경영학전공)에서 다전공(예: 복수전공)을 할 때의 학점 변화를 물으면:
+       - 데이터에 있는 '구분: 단일전공'일 때의 학점과 '구분: 복수전공'일 때의 학점을 찾아 서로 비교해주세요.
+       - "단일전공 시에는 본전공을 00학점 들어야 하지만, 복수전공을 신청하면 00학점으로 줄어듭니다"라고 명확히 말하세요.
+    25. 절대로 "구체적인 정보가 포함되어 있지 않습니다"라는 말을 먼저 하지 마세요. 데이터에 '구분'별 학점이 있다면 그것이 바로 그 정보입니다.
+    26. 정보를 표(Table) 형태로 정리해서 보여주면 학생이 이해하기 쉽습니다.
+    27. 데이터에 본전공 이름은 있는데 신청하려는 제도(예: 융합전공)에 대한 행이 없다면, "단일전공 기준은 이렇습니다. 다전공 신청 시 변동 수치는 학과 사무실에 확인이 필요합니다."라고 안내하세요.
+
+    질문: {user_input}
+    """
+
+    try:
+        # 2.0이나 2.5가 아닌 가장 대중적인 1.5 Flash를 사용합니다.
+        response = client.models.generate_content(
+            model='gemini-flash-latest', # <--- 이 이름으로 변경
+            contents=prompt
+        )
+        if response and response.text:
+            return response.text, "ai_generated"     
+    except Exception as e:
+        return str(e), "error"
+
+# === 메인 화면 로직 수정 ===
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = [
+        {"role": "assistant", "content": "안녕하세요! 한경국립대학교 다전공 안내 AI 비서입니다. 궁금한 점을 물어보세요! 🎓", "response_type": "greeting"}
+    ]
 
 # === 키워드 검색 함수 ===
 def search_by_keyword(user_input):
@@ -947,7 +1206,7 @@ def generate_response(user_input):
             elif linked_info == "신청정보":
                 response = "**신청 관련 정보** 📝\n\n"
                 response += "다전공 제도는 매 학기 초(4월, 10월), 학기말(6월, 12월)에 신청 가능합니다.\n\n"
-                response += "자세한 내용은 '❓ FAQ' 메뉴를 확인하시거나, - [📥 홈페이지 학사공지](https://www.hknu.ac.kr/kor/562/subview.do)\n를 참고해 주세요!\n\n"
+                response += "자세한 내용은 '📚 다전공 제도 안내' 또는 '❓ FAQ' 메뉴'를 확인하시거나, - [📥 홈페이지 학사공지](https://www.hknu.ac.kr/kor/562/subview.do)\n를 참고해 주세요!\n\n"
                 response += f"_🔍 키워드 '{keyword_match['키워드']}'로 검색됨_"
                 return response, "application"
             
@@ -1083,40 +1342,42 @@ with st.sidebar:
 st.title("🎓 유연학사제도(다전공) 안내 챗봇")
 
 if menu == "💬 챗봇":
-    st.subheader("🔍 주요 키워드로 빠르게 검색하기")
+    # --- 상단 질문 예시 가이드 ---
+    st.markdown("### 💡 이런 식으로 질문해 보세요!")
 
-    main_keywords = [
-        {"label": "복수전공", "query": "복수전공이 뭐야?"},
-        {"label": "부전공", "query": "부전공이 뭐야?"},
-        {"label": "연계전공", "query": "연계전공이 뭐야?"},
-        {"label": "융합전공", "query": "융합전공이 뭐야?"},
-        {"label": "마이크로디그리", "query": "마이크로디그리가 뭐야?"},
-        {"label": "학점 비교", "query": "각 제도별 학점은?"},
-        {"label": "신청 방법", "query": "신청은 언제 해?"},
-        {"label": "제도 비교", "query": "제도 비교해줘"}
+    # 추천 질문 리스트 (AI의 강점을 보여줄 수 있는 질문들)
+    example_questions = [
+        "행정학전공 2학년 과목 추천해줘",
+        "복수전공과 부전공의 차이점은?",
+        "융합전공에는 어떤 전공이 있어?", # AI가 리스트를 긁어오도록 유도
+        "다전공 신청 기간과 방법 알려줘",
+        "경영학전공 사무실 연락처랑 위치 어디야?", # 구체적인 예시로 변경
+        "복수전공 신청 시 졸업 이수 학점 변화는?"
     ]
 
-    col1, col2, col3, col4 = st.columns(4)
-    cols = [col1, col2, col3, col4]
-    
-    for idx, keyword in enumerate(main_keywords):
-        with cols[idx % 4]:
-            if st.button(
-                f"🔖 {keyword['label']}",
-                key=f"main_keyword_{idx}",
-                use_container_width=True
-            ):
-                st.session_state.chat_history.append(
-                    {"role": "user", "content": keyword["query"]}
-                )
-                response, response_type = generate_response(keyword["query"])
+    cols = st.columns(3)    
+    for idx, question in enumerate(example_questions):
+        with cols[idx % 3]:
+            # 말풍선 모양처럼 보이도록 스타일링된 버튼
+            if st.button(f"💬 {question}", key=f"ex_q_{idx}", use_container_width=True):
+                # 버튼 클릭 시 해당 질문을 채팅창에 입력한 것과 동일하게 작동
+                st.session_state.chat_history.append({"role": "user", "content": question})
+                
+                with st.spinner("AI 상담원이 답변을 준비 중입니다..."):
+                    try:
+                        ai_response, res_type = generate_ai_response(question, st.session_state.chat_history[:-1])
+                        if res_type == "error":
+                            raise Exception(ai_response)
+                    except Exception as e:
+                        # AI 실패 시 기존 검색 로직으로 작동
+                        ai_response, res_type = generate_response(question)
+                        ai_response = f"⚠️ (AI 모드 일시 오류: {str(e)[:30]})\n\n" + ai_response
+
                 st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "content": response,
-                    "response_type": response_type
+                    "role": "assistant", 
+                    "content": ai_response,
+                    "response_type": res_type
                 })
-                st.session_state.scroll_to_bottom = True
-                st.session_state.scroll_count += 1
                 st.rerun()
 
     st.divider()
@@ -1401,21 +1662,29 @@ if menu == "💬 챗봇":
                         st.info("📝 피드백 감사합니다. 더 나은 답변을 위해 노력하겠습니다!")
 
     # 사용자 입력
-    user_input = st.chat_input("메시지를 입력하세요...")
+    # 챗봇 입력창 부분
+user_input = st.chat_input("메시지를 입력하세요...")
+
+if user_input:
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
     
-    if user_input:
-        st.session_state.chat_history.append(
-            {"role": "user", "content": user_input}
-        )
-        response, response_type = generate_response(user_input)
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": response,
-            "response_type": response_type
-        })
-        st.session_state.scroll_to_bottom = True
-        st.session_state.scroll_count += 1
-        st.rerun()
+    with st.spinner("AI가 응답을 생성 중입니다..."):
+        # 1. AI 응답을 시도합니다.
+        ai_response, res_type = generate_ai_response(user_input, st.session_state.chat_history[:-1])
+        
+        # [중요] 만약 에러가 발생했다면, 화면에 빨간색으로 에러를 다 보여줍니다.
+        if res_type == "error":
+            st.error(f"❌ AI가 작동하지 않는 진짜 이유: {ai_response}")
+            # 여기서 멈춥니다. 아래 fallback 로직으로 넘어가지 않게 합니다.
+            st.stop() 
+
+    # 에러가 없을 때만 정상적으로 채팅 기록에 추가합니다.
+    st.session_state.chat_history.append({
+        "role": "assistant", 
+        "content": ai_response,
+        "response_type": res_type
+    })
+    st.rerun()
 
     # 스크롤 로직
     if st.session_state.scroll_to_bottom:
