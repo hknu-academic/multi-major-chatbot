@@ -1,21 +1,27 @@
 import streamlit as st
+from google import genai
 import pandas as pd
+from streamlit_option_menu import option_menu 
 from datetime import datetime
 import os
+from dotenv import load_dotenv  # 설치 필요
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import uuid
 import re
-from google import genai
 
 # === [AI 설정] Gemini API 연결 ===
-GEMINI_API_KEY = "AIzaSyD_4GxoAS9nL-YaOJ-Fb2ZYNhRx7y_uUAA"  # 제공해주신 키 적용
+
+if "GEMINI_API_KEY" not in st.secrets:
+    st.error("⚠️ GEMINI_API_KEY가 Secrets에 없습니다.")
+    st.stop()
+
 client = genai.Client(api_key=GEMINI_API_KEY)  # <--- Client 객체 생성 방식으로 변경
 
 # === 페이지 설정 (가장 먼저 실행되어야 함) ===
 st.set_page_config(
-    page_title="한경국립대 다전공 안내 챗봇",
+    page_title="다전공 안내 AI챗봇",
     page_icon="🎓",
     layout="wide",
 )
@@ -71,11 +77,36 @@ if "scroll_count" not in st.session_state:
 if 'show_calculator' not in st.session_state:
     st.session_state.show_calculator = False
 
-
-# 관리자 비밀번호 (환경변수 우선, 없으면 기본값)
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin1234")
+def initialize_session_state():
+    """세션 상태 초기화"""
+    defaults = {
+        'chat_history': [],
+        'user_info': {},
+        'feedback_data': [],
+        'is_admin': False
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 # === 데이터 로드 함수 ===
+@st.cache_data
+def load_all_data():
+    """모든 엑셀 데이터를 로드하여 딕셔너리로 반환"""
+    data = {}
+    try:
+        data['programs'] = load_programs()
+        data['faq'] = load_faq()
+        data['curriculum'] = load_curriculum_mapping()
+        data['courses'] = load_courses()
+        data['keywords'] = load_keywords()
+        data['grad_req'] = load_graduation_requirements()
+        data['primary_req'] = load_primary_requirements()
+        data['majors'] = load_majors_info()
+    except Exception as e:
+        st.error(f"데이터 로드 중 오류 발생: {e}")
+    return data
+
 @st.cache_data
 def load_programs():
     """제도 정보 로드"""
@@ -91,7 +122,7 @@ def load_programs():
                 'graduation_certification': row['졸업인증'] if pd.notna(row.get('졸업인증')) else '-',
                 'graduation_exam': row['졸업시험'] if pd.notna(row.get('졸업시험')) else '-',
                 'qualification': row['신청자격'],
-                'degree': row['학위표기'],
+                'degree': row['학위기 표기'],
                 'difficulty': '★' * int(row['난이도']) + '☆' * (5 - int(row['난이도'])),
                 'features': row['특징'].split(',') if pd.notna(row.get('특징')) else [],
                 'notes': row['기타'] if pd.notna(row.get('기타')) else ''
@@ -268,188 +299,384 @@ GRAD_REQUIREMENTS = load_graduation_requirements()
 PRIMARY_REQUIREMENTS = load_primary_requirements()
 MAJORS_INFO = load_majors_info()  # 🆕 전공 정보 로드
 
+def token_partial_match(root_input, target_clean):
+    """
+    root_input: 정제된 사용자 입력 (공백 제거된 상태)
+    target_clean: 전공명 정제 문자열
+    """
+    # 한글/영문 토큰 추출
+    tokens = re.findall(r'[가-힣a-zA-Z]+', root_input)
 
-# === [핵심] AI 지식 검색 함수 (RAG) ===
-def get_ai_context(user_input):
+    for t in tokens:
+        if len(t) >= 2 and t in target_clean:
+            return True
+    return False
+
+def normalize_major_type(val):
+    v = str(val)
+    if '필수' in v or '전필' in v:
+        return '전공필수'
+    if '선택' in v or '전선' in v:
+        return '전공선택'
+    return '기타'
+
+# === [핵심] AI 지식 검색 함수 (RAG) - 수정 버전 ===
+def get_ai_context(user_input, data_dict):
     context = ""
     user_input_clean = user_input.replace(" ", "").lower()
 
-    # 1. 어떤 다전공 제도에 관심이 있는지 파악 (복수, 부, 융합 등)
-    target_program = None
-    for p in ["복수전공", "부전공", "융합전공", "융합부전공", "연계전공", "마이크로디그리"]:
-        if p in user_input_clean or p[:2] in user_input_clean:
-            target_program = p
-            break
+    # ✅ 반드시 먼저 초기화
+    is_course_query = False
+    is_contact_query = False
 
-    # 2. 본전공 이수요건 변동 정보 검색 (PRIMARY_REQUIREMENTS 활용)
-    if not PRIMARY_REQUIREMENTS.empty:
-        # 전공 핵심어 추출 (예: 경영학전공 -> 경영)
-        root_input = re.sub(r'(전공|학과|학부|의|신청|학점|어떻게|변해|알려줘|추천)', '', user_input_clean)
-        
-        # 전공명 매칭
-        matched_primary = []
-        for m in PRIMARY_REQUIREMENTS['전공명'].unique():
-            if root_input in str(m).lower() or str(m).lower().replace("전공","") in root_input:
-                matched_primary.append(m)
-        
-        if matched_primary:
-            for m in matched_primary[:1]: # 가장 유사한 전공 하나 선택
-                df_major = PRIMARY_REQUIREMENTS[PRIMARY_REQUIREMENTS['전공명'] == m]
-                
-                # [중요] 해당 전공의 모든 이수 요건(단일전공 포함)을 다 AI에게 줍니다.
-                # 그래야 AI가 '단일전공'과 '복수전공'을 비교해서 설명할 수 있습니다.
-                context += f"### [{m}] 본전공 이수학점 상세 기준\n"
-                for _, row in df_major.iterrows():
-                    context += f"- 구분: {row['구분']}\n"
-                    context += f"  * 본전공 전필: {row.get('본전공_전필', 0)}학점\n"
-                    context += f"  * 본전공 전선: {row.get('본전공_전선', 0)}학점\n"
-                    context += f"  * 본전공 총합: {row.get('본전공_계', 0)}학점\n"
-                context += "\n"
+    is_course_query = any(
+        w in user_input_clean
+        for w in ["과목", "교과목", "추천", "리스트", "수강", "학년"]
+    )
 
-    # 1. 제도 카테고리 감지 (리스트를 뽑기 위한 키워드)
-    # 사용자가 '융합전공 종류', '마디 리스트' 등을 물어볼 때 대응
-    categories = {
-        "융합전공": ["융합전공", "융합"],
-        "부전공": ["부전공"],
-        "복수전공": ["복수전공", "복전"],
-        "마이크로디그리": ["마이크로디그리", "마디", "소단위", "md"],
-        "연계전공": ["연계전공", "연계"]
-    }
+    is_contact_query = any(
+        w in user_input_clean
+        for w in ["연락처", "사무실", "위치", "번호"]
+    )
 
-    target_category = None
-    for cat_name, keywords in categories.items():
-        if any(kw in user_input_clean for kw in keywords):
-            target_category = cat_name
-            # 사용자가 리스트를 원할 경우를 대비해 해당 카테고리 전체를 긁어옴
-            if not MAJORS_INFO.empty and '제도유형' in MAJORS_INFO.columns:
-                # '제도유형' 컬럼에 해당 카테고리명이 포함된 전공들 추출
-                matched_rows = MAJORS_INFO[MAJORS_INFO['제도유형'].str.contains(cat_name, na=False)]
-                if not matched_rows.empty:
-                    major_list = matched_rows['전공명'].tolist()
-                    context += f"[{cat_name} 전체 목록]\n- 현재 운영 중인 전공: {', '.join(major_list)}\n"
-                    context += "(이 리스트를 학생에게 모두 나열하며 안내해주세요.)\n\n"
+    # 데이터 가져오기 (전역 변수 활용 및 안전장치)
+    majors_info = data_dict.get('majors', MAJORS_INFO)
+    primary_req = data_dict.get('primary_req', PRIMARY_REQUIREMENTS)
+    courses_data = data_dict.get('courses', COURSES_DATA)
+    faq_data = data_dict.get('faq', FAQ_DATA)
+    prog_info = data_dict.get('programs', PROGRAM_INFO)
 
-    # [의도 파악용 키워드]
+    # MD 쿼리 여부 판단
+    is_md_query = any(k in user_input_clean for k in ['md', '마이크로', '소단위', '마디'])
+
+    # 1️⃣ 질문 의도 판별
+    is_contact_query = any(
+        w in user_input_clean
+        for w in ["연락처", "사무실", "위치", "번호"]
+    )
+    
+    # 1️⃣ 전공/MD 여부 판별
+    is_md_query = any(
+        w in user_input_clean
+        for w in ["마이크로디그리", "소단위", "MD"]
+    )
+
+    # 2️⃣ 전공명 핵심어 추출
+    raw_keyword = re.sub(r'[^\w]', '', user_input_clean)
     is_contact_query = any(w in user_input_clean for w in ["연락처", "사무실", "위치", "번호"])
-    is_major_list_query = any(w in user_input_clean for w in ["전공", "종류", "리스트", "뭐있어"])
-    is_apply_query = any(w in user_input_clean for w in ["신청", "기간", "절차", "방법", "언제"])
-    
-    # 1. 특정 전공 매칭 시도
-    root_input = re.sub(r'(전공|학과|학부|의|과목|학년|리스트|추천|해줘|알려줘|뭐있어|설명|연락처|위치|사무실)', '', user_input_clean)
+  
+    if is_md_query:
+        root_input = re.sub(r'(보여줘|알려줘|교과목|리스트|과목|뭐야|뭐있어|추천|해줘)', '', raw_keyword)
 
-    if len(root_input) >= 2: # 최소 2글자 이상일 때만 상세 검색
-        matched_majors = set()
-        if not MAJORS_INFO.empty:
-           for m in MAJORS_INFO['전공명'].unique():
-                if root_input in str(m).lower() or str(m).lower().replace("전공","") in root_input:
-                    matched_majors.add(str(m))
-       
-    for major in list(matched_majors)[:2]:
-            m_info = MAJORS_INFO[MAJORS_INFO['전공명'] == major]
-            if not m_info.empty:
-                row = m_info.iloc[0]
-                context += f"[{major} 상세정보]\n- 연락처: {row.get('연락처','-')}\n- 위치: {row.get('위치','-')}\n- 소개: {row.get('전공설명','-')}\n\n"
-
-    # 2. 데이터 수집
-    if matched_majors:
-        # 특정 전공이 매칭된 경우 (상세 정보 제공)
-        for major in list(matched_majors)[:2]:
-            m_info = MAJORS_INFO[MAJORS_INFO['전공명'] == major]
-            if not m_info.empty:
-                row = m_info.iloc[0]
-                context += f"[{major} 정보]\n- 연락처: {row.get('연락처','-')}\n- 위치: {row.get('위치','-')}\n- 소개: {row.get('전공설명','-')}\n\n"
-    
-    # [핵심 수정] 특정 전공이 없어도 범용 질문이면 '맛보기' 데이터 주입
     elif is_contact_query:
-        context += "[주요 전공 연락처 맛보기]\n"
-        # 상위 5개 전공 정보를 미리 줍니다.
-        for _, row in MAJORS_INFO.head(5).iterrows():
-            context += f"- {row['전공명']}: {row.get('연락처','-')} ({row.get('위치','-')})\n"
-        context += f"\n[전체 전공 목록]: {', '.join(all_majors[:15])}... 등\n"
+        # ❗ 연락처 질문일 때는 "전공"만 제거, 핵심 명칭은 살린다
+        root_input = re.sub(r'(학과|학부)', '', raw_keyword)
 
-    # 2. 학년 파악 (1~4학년)
+    else:
+        root_input = re.sub(
+            r'(전공|학과|학부|과목|학년|신청|학점|보여줘|알려줘|교과목|리스트)',
+            '',
+            raw_keyword
+        )
+
+    if is_course_query:
+        # ❗ 전공명 보존
+        root_input = re.sub(
+            r'(학년|과목|추천|해줘|알려줘)',
+            '',
+            raw_keyword
+        )
+    else:
+        root_input = re.sub(
+            r'(전공|학과|학부|신청|학점)',
+            '',
+            raw_keyword
+        )
+
+    # 전공 목록 확보
+    all_majors_set = set()
+    if not majors_info.empty:
+        names = majors_info['전공명'].dropna().astype(str).unique()
+        all_majors_set.update(names)
+    if not courses_data.empty:
+        names = courses_data['전공명'].dropna().astype(str).unique()
+        all_majors_set.update(names)
+    all_majors_list = list(all_majors_set)
+
     target_year = None
     for i in range(1, 5):
-        if f"{i}학년" in user_input_clean or str(i) in user_input_clean:
+        if f"{i}학년" in user_input_clean:
             target_year = i
             break
-    
-    # 3. 전공 매칭 로직 (중복 제거를 위해 set 사용)
+
+    # 3️⃣ 🔥 전공 매칭 (matched_majors 생성)
     matched_majors = set()
-    if not COURSES_DATA.empty:
-        all_majors = COURSES_DATA['전공명'].unique()
-        for m in all_majors:
-            m_str = str(m)
-            m_clean = m_str.replace(" ", "").lower()
-            m_root = re.sub(r'(전공|학과|학부)', '', m_clean)
-            
-            # 검색어가 전공명에 포함되거나, 전공 핵심어가 검색어에 포함되는 경우 매칭
-            if root_input in m_clean or m_root in root_input:
+    
+    major_list = set()
+
+    if not majors_info.empty and '전공명' in majors_info.columns:
+        major_list.update(
+            majors_info['전공명'].dropna().astype(str).unique()
+        )
+
+    if not courses_data.empty and '전공명' in courses_data.columns:
+        major_list.update(
+            courses_data['전공명'].dropna().astype(str).unique()
+        )
+
+    major_list = list(major_list)
+
+    # 5️⃣ 과목/추천 질문인지 판별
+    is_course_query = any(w in user_input_clean for w in [
+        "과목", "추천", "수강", "강의"
+    ])
+
+   # 4️⃣ 🔥 학년 추출
+    year_match = re.search(r'([1-4])\s*학년', user_input_clean)
+    target_year = int(year_match.group(1)) if year_match else None
+
+    # 4️⃣ 과목 조회 분기 (🔥 이게 핵심)
+    if is_course_query and matched_majors:
+        for m_str in matched_majors:
+            major_courses = COURSES_DATA[COURSES_DATA['전공명'] == m_str]
+
+            # 학년 필터
+            if target_year:
+                major_courses = major_courses[
+                    major_courses['학년'] == target_year
+                ]
+
+            # 🔹 마이크로디그리 제외
+            if '제도유형' in major_courses.columns:
+                major_courses = major_courses[
+                    ~major_courses['제도유형']
+                    .astype(str)
+                    .str.contains('소단위|마이크로|MD', case=False, na=False)
+                ]
+
+            if major_courses.empty:
+                context += f"[안내] {m_str} {target_year}학년 과목 정보가 데이터에 없습니다.\n"
+                continue
+                
+            # ✅ 🔥 여기!!!! (당신이 물어본 코드)
+            major_courses['전공구분정리'] = (
+                major_courses['이수구분'].apply(normalize_major_type)
+            )
+
+            required_courses = major_courses[
+                major_courses['전공구분정리'] == '전공필수'
+            ]
+
+            elective_courses = major_courses[
+                major_courses['전공구분정리'] == '전공선택'
+            ]
+
+            # 🔹 이제부터 "추천" 출력
+            context += f"### [{major} {target_year}학년 추천 과목]\n"
+
+            if not required_courses.empty:
+                context += "🔹 전공필수 과목\n"
+                for _, row in required_courses.head(10).iterrows():
+                    context += f"- {row['과목명']} ({row.get('학기','-')}학기)\n"
+
+            if not elective_courses.empty:
+                context += "\n🔹 전공선택 과목\n"
+                for _, row in elective_courses.head(10).iterrows():
+                    context += f"- {row['과목명']} ({row.get('학기','-')}학기)\n"
+
+            context += "\n"
+
+    for m_str in major_list:
+        m_clean = re.sub(r'\s+', '', m_str)
+        m_root = m_clean.replace("전공", "")
+
+        # 1️⃣ 1순위
+        if root_input in m_clean or root_input in m_root:
+              matched_majors.add(m_str)
+        # 2️⃣ 2순위
+        elif len(root_input) >= 4 and root_input[:4] in m_clean:
+            matched_majors.add(m_str)
+
+    # =============================== 
+    # 🔒 연락처 질문 전용 보강 로직 (추가)
+    # ===============================
+    if is_contact_query and not matched_majors:
+        for m_str in major_list:
+            if m_str.replace(" ", "") in raw_keyword:
                 matched_majors.add(m_str)
 
-    # 4. 수집된 정보를 바탕으로 Context 구성
+    # 매칭된 전공 상세 정보 추가
     if matched_majors:
-        # 후보군 리스트 생성
-        context += f"[검색된 전공 후보군: {', '.join(matched_majors)}]\n\n"
-        
-        # 각 전공별 상세 정보 및 과목 추출
-        for major in list(matched_majors)[:2]: # 토큰 절약을 위해 최대 2개 전공만 상세 안내
-            # A. 전공 기본 정보 (연락처, 설명 등)
-            if not MAJORS_INFO.empty:
-                m_info = MAJORS_INFO[MAJORS_INFO['전공명'] == major]
-                if not m_info.empty:
-                    row = m_info.iloc[0]
-                    context += f"[{major} 상세 정보]\n- 소개: {row.get('전공설명','-')}\n- 연락처: {row.get('연락처','-')}\n- 위치: {row.get('위치','-')}\n"
+        context += f"[검색된 특정 전공: {', '.join(matched_majors)}]\n\n"
 
-            # B. 전공 과목 정보
-            major_courses = COURSES_DATA[COURSES_DATA['전공명'] == major]
-            if target_year:
-                major_courses = major_courses[major_courses['학년'] == target_year]
-                context += f"[{major} {target_year}학년 과목 리스트]\n"
-            else:
-                context += f"[{major} 주요 과목 리스트]\n"
+        for m_name in list(matched_majors)[:3]:  # 최대 3개까지
+            # A. 기본 정보 (연락처 등)
+            if not majors_info.empty:
+                m_rows = majors_info[majors_info['전공명'] == m_name]
+                if not m_rows.empty:
+                    m_row = m_rows.iloc[0]
+                    p_type = str(m_row.get('제도유형', ''))
+                    
+                    context += f"### [{m_name} 상세정보]\n"
+                    
+                    # MD가 아닐 때만 연락처 제공
+                    if '마이크로' not in p_type and '소단위' not in p_type:
+                        context += f"- 연락처: {m_row.get('연락처','-')}\n"
+                        context += f"- 위치: {m_row.get('위치','-')}\n"
+                    
+                    context += f"- 제도유형: {p_type}\n"
+                    context += f"- 소개: {m_row.get('전공설명','-')}\n\n"
             
-            # 주요 과목 15개까지만 출력
-            for _, row in major_courses.head(15).iterrows():
-                context += f"- {row['학년']}학년 {row['학기']}학기: [{row['이수구분']}] {row['과목명']} ({row['학점']}학점)\n"
-            context += "\n"
-    else:
-        # 매칭된 전공이 없을 때
-        if len(root_input) > 1:
-            context += f"[안내] 입력하신 '{root_input}'와 일치하는 전공을 찾지 못했습니다. 학생에게 정확한 전공명을 물어봐주세요.\n"
+            # B. 과목 정보
+            if not courses_data.empty and is_course_query:
+                for major in matched_majors:
+                    major_courses = courses_data[courses_data['전공명'] == major]
 
-    # 6. FAQ 검색 (기존 중복 방지 로직 유지)
-    if FAQ_DATA:
-        added_faqs = set()
-        # A. 사용자가 '신청'을 물어보면 '신청'이 포함된 모든 FAQ를 우선 수집
-        if is_apply_query:
-            for faq in FAQ_DATA:
-                if "신청" in str(faq['질문']) or "기간" in str(faq['질문']):
-                    context += f"[학사 안내: 신청 관련]\nQ: {faq['질문']}\nA: {faq['답변']}\n\n"
-                    added_faqs.add(faq['질문'])
+                    # ✅ [핵심] MD 질문이 아니면 마이크로디그리 과목 제외
+                    if not is_md_query and '제도유형' in major_courses.columns:
+                        major_courses = major_courses[
+                            ~major_courses['제도유형']
+                            .astype(str)
+                            .str.contains('소단위|마이크로|MD', case=False, na=False)
+                        ]
 
-        # B. 일반 키워드 매칭
-        for faq in FAQ_DATA:
-            if faq['질문'] not in added_faqs:
-                if user_input_clean in str(faq['질문']).lower() or user_input_clean in str(faq['답변']).lower():
-                    context += f"[참고 FAQ]\nQ: {faq['질문']}\nA: {faq['답변']}\n\n"
-                    added_faqs.add(faq['질문'])
+                    # ✅ 학년 필터
+                    if target_year:
+                        major_courses = major_courses[
+                            major_courses['학년']
+                                .astype(str)
+                                .str.startswith(str(target_year))
+                        ]
 
-    # 3. 제도 정보 검색 (PROGRAM_INFO)
-    for p_name, p_info in PROGRAM_INFO.items():
+                    if major_courses.empty:
+                        context += f"[안내] {major} {target_year}학년 과목 정보가 데이터에 없습니다.\n"
+                    else:
+                        context += f"### [{major} {target_year}학년 추천 과목]\n"
+                        for _, row in major_courses.head(15).iterrows():
+                            context += (
+                                f"- {row.get('학년','-')}학년 "
+                                f"{row.get('학기','-')}학기: "
+                                f"{row.get('과목명')} ({row.get('학점','-')}학점)\n"
+                            )
+                        context += "\n"
+
+    # ==========================================================
+    # [2] 마이크로디그리 전용 추가 검색 (is_md_query일 때만)
+    # ==========================================================
+    if is_md_query and not courses_data.empty:
+        if '제도유형' in courses_data.columns and '전공명' in courses_data.columns:
+            
+            # MD 과목만 필터링
+            md_courses_df = courses_data[
+                courses_data['제도유형'].astype(str).str.contains('소단위|마이크로|MD', case=False, na=False)
+            ]
+            
+            if not md_courses_df.empty:
+                md_major_list = md_courses_df['전공명'].unique()
+                matched_md_majors = []
+
+                for m_name in md_major_list:
+                    m_str = str(m_name)
+                    m_clean = re.sub(r'^\d+\.?\s*', '', m_str)
+                    m_clean = re.sub(r'[^\w]', '', m_clean.lower())
+                    
+                    paren_match = re.search(r'\(([^)]+)\)', m_str)
+                    parent_major = ""
+                    if paren_match:
+                        parent_major = re.sub(r'[^\w]', '', paren_match.group(1).lower())
+                    
+                    match_found = False
+                    
+                    if root_input in m_clean or m_clean in root_input:
+                        match_found = True
+                    elif token_partial_match(root_input, m_clean):
+                        match_found = True
+                    elif parent_major and token_partial_match(root_input, parent_major):
+                        match_found = True
+                    elif len(root_input) >= 4 and root_input[:4] in m_clean:
+                        match_found = True
+                    
+                    if match_found and m_name not in matched_majors:
+                        matched_md_majors.append(m_name)
+
+                # MD 매칭 결과 추가
+                if matched_md_majors:
+                    for m_name in matched_md_majors:
+                        context += f"### [🎯 {m_name} 과목 리스트]\n"
+                        context += "※ 이 과목들은 '소단위전공과정(마이크로디그리)' 이수용 과목입니다.\n"
+                        
+                        m_courses = md_courses_df[md_courses_df['전공명'] == m_name]
+                        for _, row in m_courses.head(25).iterrows():
+                            grade = row.get('학년', '-')
+                            term = row.get('학기', '-')
+                            try:
+                                grade = int(float(grade))
+                            except:
+                                pass
+                            try:
+                                term = int(float(term))
+                            except:
+                                pass
+                            
+                            context += f"- {grade}학년 {term}학기: {row['과목명']} ({row['학점']}학점)\n"
+                        context += "\n"
+
+    # ==========================================================
+    # [3] 제도 카테고리 리스트 (특정 전공이 없을 때만)
+    # ==========================================================
+    if not matched_majors:
+        categories = {
+            "융합전공": ["융합전공", "융합"],
+            "부전공": ["부전공"],
+            "복수전공": ["복수전공", "복전"],
+            "마이크로디그리": ["마이크로디그리", "마디", "소단위", "md"],
+            "연계전공": ["연계전공", "연계"]
+        }
+
+        for cat_name, keywords in categories.items():
+            if any(kw in user_input_clean for kw in keywords):
+                if not majors_info.empty and '제도유형' in majors_info.columns:
+                    matched_rows = majors_info[majors_info['제도유형'].str.contains(cat_name, na=False)]
+                    if not matched_rows.empty:
+                        major_list = matched_rows['전공명'].tolist()
+                        context += f"[{cat_name} 전체 목록]\n- {', '.join(major_list)}\n\n"
+
+    # ==========================================================
+    # [4] 본전공 이수요건 검색
+    # ==========================================================
+    if not primary_req.empty:
+        pm_input = re.sub(r'(전공|학과|학부|의|신청|학점|알려줘|md)', '', user_input_clean)
+        matched_primary = [m for m in primary_req['전공명'].unique() if pm_input in str(m).lower()]
+        
+        for m in matched_primary[:1]:
+            df_major = primary_req[primary_req['전공명'] == m]
+            context += f"### [{m}] 본전공 이수학점 상세 기준\n"
+            for _, row in df_major.iterrows():
+                context += f"- 구분: {row['구분']}, 본전공필수: {row.get('본전공_전필',0)}, 전공선택: {row.get('본전공_전선',0)}, 계: {row.get('본전공_계',0)}\n"
+
+    # ==========================================================
+    # [5] FAQ 검색
+    # ==========================================================
+    if faq_data:
+        for faq in faq_data:
+            if user_input_clean in str(faq['질문']).replace(" ","").lower():
+                context += f"[FAQ] Q: {faq['질문']}\nA: {faq['답변']}\n\n"
+
+    # ==========================================================
+    # [6] 제도 자체 설명
+    # ==========================================================
+    for p_name, p_info in prog_info.items():
         if p_name in user_input_clean:
-            context += f"### [{p_name}] 제도 자체 이수 기준\n"
-            context += f"- 설명: {p_info['description']}\n"
-            context += f"- 이 제도 이수를 위해 필요한 학점: {p_info['credits_multi']}\n\n"
+            context += f"### [{p_name}] 제도 설명\n- {p_info['description']}\n- 이수학점: {p_info['credits_multi']}\n\n"
 
     return context
 
 # === [핵심] Gemini API 답변 생성 ===
-def generate_ai_response(user_input, chat_history):
+def generate_ai_response(user_input, chat_history, data_dict):
     """Gemini API를 사용하여 답변 생성"""
     
     # 1. 엑셀에서 관련 지식 추출
-    context = get_ai_context(user_input)
+    context = get_ai_context(user_input, data_dict)
     
     # 2. 대화 기록 요약 (최근 3개만)
     history_text = ""
@@ -463,10 +690,12 @@ def generate_ai_response(user_input, chat_history):
     학생이 다전공 신청에 대해 물으면, 다전공 학점뿐만 아니라 [본전공 학점 변동] 정보도 반드시 확인해서 알려주세요.
     
     [학사 데이터]
-    {context if context else "검색 결과 없음"}
+    {context if context else "검색 결과 없음. 정확한 정보는 전공 사무실 문의를 권고하세요"}
 
     [대화 기록]
     {history_text}
+
+    질문: {user_input}
 
     [규칙]
     1. 반드시 제공된 [학사 데이터]를 최우선으로 참고하여 답변하세요.
@@ -481,7 +710,7 @@ def generate_ai_response(user_input, chat_history):
        - "혹시 '행정학전공'을 찾으시는 걸까요?"와 같이 후보군 중에서 가장 가능성 높은 전공을 되물어보세요.
        - 데이터에 검색된 후보군({context.split(']')[0] if ']' in context else ''})이 있다면 이를 리스트로 보여주세요.
     10. 질문 가이드 제공:
-       - 답변 마지막에 항상 "💡 더 정확한 정보를 원하시면 '행정학전공 2학년 과목 알려줘'와 같이 [전공명 + 학년]을 포함하여 질문해 주세요!"라는 가이드를 넣으세요.
+       - 답변 마지막에 항상 "💡 더 정확한 정보를 원하시면 '경영학전공 2학년 과목 알려줘'와 같이 세부적으로 질문해 주세요!"라는 가이드를 넣으세요.
     11. 과목 추천:
        - 데이터에 과목 정보가 있다면 되묻는 동시에 "우선 찾으시는 전공일 것으로 예상되는 {context.split('[')[1].split(' ')[0] if '[' in context else '해당 전공'}의 과목을 안내해 드립니다"라며 맛보기 정보를 제공하세요.
     12. 친절도: 학생을 대하듯 친절하고 따뜻하게 답변하세요.
@@ -492,7 +721,7 @@ def generate_ai_response(user_input, chat_history):
     17. 정보가 많아 리스트를 보여준 후에는, "더 궁금한 특정 전공이 있다면 이름을 말씀해 주세요!"라고 자연스럽게 유도하세요.
     18. 만약 특정 전공의 신청 절차가 데이터에 없다면, 제공된 [데이터] 중 '다전공 신청'이나 '일반적인 신청 기간' 정보를 활용하여 "공통적으로 다전공 신청은 매년 4월, 10월경에 진행됩니다"와 같이 아는 범위 내에서 최대한 답변하세요.
     19. 데이터에 신청 기간 정보가 조금이라도 있다면 그것을 최우선으로 안내하세요.
-    20. 정보가 정 부족하다면 답변 끝에 "더 상세한 개인별 상황은 학사지원팀(031-670-5035)에 문의하면 정확히 확인할 수 있습니다"라고 덧붙이세요.
+    20. 정보가 정 부족하다면 답변 끝에 "더 상세한 개인별 상황은 학사지원팀(031-670-5035) 또는 전공에 문의하면 정확히 확인할 수 있습니다"라고 덧붙이세요.
     21. 데이터에 [본전공 학점 변동 정보]가 포함되어 있다면, 이를 강조해서 안내하세요. 
     22. 예: "행정학전공 학생이 복수전공을 신청하면, 본전공 이수 학점이 기존 70학점에서 45학점으로 줄어들어 부담이 적어집니다!"와 같은 방식으로 설명하세요.
     23. 만약 사용자의 전공이 무엇인지 모른다면, "본전공에 따라 다전공 신청 시 본전공 이수 학점이 줄어들 수 있으니, 본전공 이름을 말씀해주시면 더 정확히 안내해 드릴게요."라고 친절히 되물으세요.
@@ -502,26 +731,49 @@ def generate_ai_response(user_input, chat_history):
     25. 절대로 "구체적인 정보가 포함되어 있지 않습니다"라는 말을 먼저 하지 마세요. 데이터에 '구분'별 학점이 있다면 그것이 바로 그 정보입니다.
     26. 정보를 표(Table) 형태로 정리해서 보여주면 학생이 이해하기 쉽습니다.
     27. 데이터에 본전공 이름은 있는데 신청하려는 제도(예: 융합전공)에 대한 행이 없다면, "단일전공 기준은 이렇습니다. 다전공 신청 시 변동 수치는 학과 사무실에 확인이 필요합니다."라고 안내하세요.
+    28. 마이크로디그리(MD)를 이수하더라도 **본전공(1전공) 졸업 이수 학점은 줄어들지 않습니다.**
+    29. 본전공 학점이 줄어드는(감면되는) 경우는 오직 '복수전공', '부전공', '융합전공', '융합부전공' 뿐입니다.
+    30. 질문자가 마이크로디그리의 학점 변동을 물어보면 "마이크로디그리는 본전공 학점 감면이 없으며, 기존 본전공 학점을 모두 이수해야 합니다"라고 명확히 하고, 단, 본전공 과목과 마이크로디그리의 과목과 일치하면 둘다 인정된다라고 답변하세요.
+    31. 마이크로디그리 과정은 별도의 행정실이 없으므로 연락처를 안내하지 마세요. 대신 "해당 과정은 기존 전공의 교과목을 조합한 과정이므로, 개설된 주관 전공 사무실로 문의해주세요"라고 안내하세요.
 
     질문: {user_input}
     """
 
     try:
-        # 2.0이나 2.5가 아닌 가장 대중적인 1.5 Flash를 사용합니다.
+        # 최신 google-genai SDK 호출 방식
         response = client.models.generate_content(
-            model='gemini-flash-latest', # <--- 이 이름으로 변경
+            model='gemini-2.0-flash',
             contents=prompt
         )
         if response and response.text:
-            return response.text, "ai_generated"     
+            return response.text, "ai_generated"
+        else:
+            return "죄송합니다. 답변을 생성하지 못했습니다.", "error"
     except Exception as e:
-        return str(e), "error"
+        return f"AI 연결 오류가 발생했습니다: {str(e)}", "error"
 
 # === 메인 화면 로직 수정 ===
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = [
         {"role": "assistant", "content": "안녕하세요! 한경국립대학교 다전공 안내 AI 비서입니다. 궁금한 점을 물어보세요! 🎓", "response_type": "greeting"}
     ]
+
+def ask_chatbot(user_input):
+    # 1. 키워드 기반으로 데이터에서 '지식 소스' 확보 (기존 keyword_match 로직 활용)
+    # 직접 답변을 출력하지 않고, AI에게 전달할 context 변수에 담습니다.
+    extracted_context = get_ai_context(user_input, all_data)
+    
+    # 2. 만약 정말 특수한 시스템 명령(예: "계산기 켜줘")이라면 즉시 처리
+    if "계산기" in user_input:
+        return "계산기 기능을 실행합니다.", "command_calc"
+
+    # 3. 확보된 지식을 AI에게 던져서 "이 내용 기반으로 친절하게 답해줘"라고 시킴
+    try:
+        response_text, res_type = generate_ai_response(user_input, st.session_state.chat_history, all_data)
+        return response_text, res_type
+    except:
+        # AI가 실패할 경우에만 백업용으로 기존 키워드 답변 출력 (Fallback)
+        return generate_response(user_input)
 
 # === 키워드 검색 함수 ===
 def search_by_keyword(user_input):
@@ -559,6 +811,11 @@ def find_majors_with_details(user_input):
     results = []
     
     for _, row in MAJORS_INFO.iterrows():
+        # [수정] 마이크로디그리/소단위전공은 연락처 안내에서 제외
+        p_type = str(row.get('제도유형', ''))
+        if '마이크로' in p_type or '소단위' in p_type:
+            continue
+
         # 데이터 정제
         major_name = str(row['전공명']).strip()
         major_clean = major_name.replace(" ", "").lower()
@@ -867,215 +1124,11 @@ def create_comparison_table():
         "다전공 이수학점": [info["credits_multi"] for info in PROGRAM_INFO.values()],
         "졸업인증": [info["graduation_certification"] for info in PROGRAM_INFO.values()],
         "졸업시험": [info["graduation_exam"] for info in PROGRAM_INFO.values()],
-        "학위표기": [info["degree"] for info in PROGRAM_INFO.values()],
+        "학위기 표기": [info["degree"] for info in PROGRAM_INFO.values()],
         "난이도": [info["difficulty"] for info in PROGRAM_INFO.values()],
         "신청자격": [info["qualification"] for info in PROGRAM_INFO.values()]
     }
     return pd.DataFrame(data)
-
-# === 졸업학점 계산 및 다전공 추천 함수 ===
-def calculate_remaining_credits(primary_major, admission_year, completed_required, completed_elective):
-    """본전공 졸업요건 대비 남은 학점 계산"""
-    if PRIMARY_REQUIREMENTS.empty:
-        return None
-    
-    pri_data = PRIMARY_REQUIREMENTS[PRIMARY_REQUIREMENTS['전공명'] == primary_major].copy()
-    pri_data['기준학번'] = pd.to_numeric(pri_data['기준학번'], errors='coerce')
-    pri_valid = pri_data[pri_data['기준학번'] <= admission_year]
-    
-    if pri_valid.empty:
-        return None
-    
-    # 단일전공 기준 찾기
-    pri_valid = pri_valid.sort_values('기준학번', ascending=False)
-    single_major_row = None
-    
-    for _, row in pri_valid.iterrows():
-        if '단일전공' in str(row['구분']) or pd.isna(row['구분']):
-            single_major_row = row
-            break
-    
-    if single_major_row is None:
-        single_major_row = pri_valid.iloc[0]
-    
-    required_credits = int(single_major_row['본전공_전필'])
-    elective_credits = int(single_major_row['본전공_전선'])
-    total_required = required_credits + elective_credits
-    
-    remaining_required = max(0, required_credits - completed_required)
-    remaining_elective = max(0, elective_credits - completed_elective)
-    total_remaining = remaining_required + remaining_elective
-    
-    completed_total = completed_required + completed_elective
-    progress = (completed_total / total_required * 100) if total_required > 0 else 0
-    
-    return {
-        'required_credits': required_credits,
-        'elective_credits': elective_credits,
-        'total_required': total_required,
-        'remaining_required': remaining_required,
-        'remaining_elective': remaining_elective,
-        'total_remaining': total_remaining,
-        'completed_total': completed_total,
-        'progress': progress
-    }
-
-def recommend_programs(primary_major, admission_year, current_grade, completed_required, completed_elective):
-    """다전공 추천 시스템"""
-    recommendations = []
-    
-    # 현재 학년에서 남은 학기 계산 (8학기 기준)
-    remaining_semesters = (8 - (current_grade * 2 - 2)) if current_grade <= 4 else 2
-    
-    # 본전공 남은 학점
-    primary_result = calculate_remaining_credits(primary_major, admission_year, completed_required, completed_elective)
-    
-    if primary_result is None:
-        return []
-    
-    primary_remaining = primary_result['total_remaining']
-    
-    # 각 제도별 분석
-    for program_name, program_info in PROGRAM_INFO.items():
-        # 학점 요구사항 파싱
-        major_credits_str = program_info['credits_multi']
-        
-        # 숫자 추출
-        credits_match = re.search(r'(\d+)', major_credits_str)
-        if not credits_match:
-            continue
-        
-        required_credits = int(credits_match.group(1))
-        
-        # 난이도 점수
-        difficulty = program_info['difficulty'].count('★')
-        
-        # 본전공 변동 학점 확인
-        additional_primary_credits = 0
-        if not PRIMARY_REQUIREMENTS.empty and primary_major:
-            pri_data = PRIMARY_REQUIREMENTS[PRIMARY_REQUIREMENTS['전공명'] == primary_major].copy()
-            pri_data['기준학번'] = pd.to_numeric(pri_data['기준학번'], errors='coerce')
-            pri_valid = pri_data[pri_data['기준학번'] <= admission_year]
-            
-            if not pri_valid.empty:
-                pri_valid = pri_valid.sort_values('기준학번', ascending=False)
-                
-                for _, p_row in pri_valid.iterrows():
-                    if program_name in str(p_row['구분']):
-                        single_total = primary_result['total_required']
-                        modified_total = int(p_row['본전공_계'])
-                        additional_primary_credits = max(0, modified_total - single_total)
-                        break
-        
-        # 총 필요 학점
-        total_needed = required_credits + additional_primary_credits
-        
-        # 학기당 평균 이수 가능 학점
-        available_credits_per_semester = 18
-        total_available_credits = remaining_semesters * available_credits_per_semester
-        
-        # 본전공에 쓸 학점 제외
-        net_available = total_available_credits - primary_remaining
-        
-        # 가능성 점수 계산
-        if net_available <= 0:
-            feasibility = "매우 낮음"
-            score = 0
-        elif total_needed <= net_available * 0.6:
-            feasibility = "높음"
-            score = 90 - (difficulty * 5)
-        elif total_needed <= net_available * 0.85:
-            feasibility = "보통"
-            score = 70 - (difficulty * 5)
-        elif total_needed <= net_available:
-            feasibility = "낮음"
-            score = 50 - (difficulty * 5)
-        else:
-            feasibility = "매우 낮음"
-            score = max(0, 30 - (difficulty * 5))
-        
-        # 이유 생성
-        reasons = []
-        if feasibility in ["높음", "보통"]:
-            reasons.append(f"✅ 남은 학기 내 이수 가능 ({remaining_semesters}학기)")
-            if difficulty <= 2:
-                reasons.append("✅ 낮은 난이도")
-            if additional_primary_credits == 0:
-                reasons.append("✅ 본전공 학점 변동 없음")
-        else:
-            if total_needed > net_available:
-                reasons.append(f"⚠️ 필요 학점({total_needed})이 여유 학점({int(net_available)})보다 많음")
-            if difficulty >= 4:
-                reasons.append("⚠️ 높은 난이도")
-            if additional_primary_credits > 0:
-                reasons.append(f"⚠️ 본전공 학점 {additional_primary_credits}학점 추가 필요")
-        
-        recommendations.append({
-            'program': program_name,
-            'feasibility': feasibility,
-            'score': score,
-            'required_credits': required_credits,
-            'additional_primary_credits': additional_primary_credits,
-            'total_needed': total_needed,
-            'net_available': int(net_available),
-            'difficulty': difficulty,
-            'reasons': reasons,
-            'description': program_info['description'],
-            'degree': program_info['degree']
-        })
-    
-    # 점수순 정렬
-    recommendations.sort(key=lambda x: x['score'], reverse=True)
-    
-    return recommendations
-
-def generate_action_plan(recommendation, current_grade, remaining_semesters):
-    """구체적인 액션 플랜 생성"""
-    program = recommendation['program']
-    feasibility = recommendation['feasibility']
-    
-    plan = []
-    
-    if feasibility == "높음":
-        plan.append(f"**1단계: 지금 바로 신청 준비 🚀**")
-        plan.append(f"- {program} 신청 자격 확인 (평점 등)")
-        plan.append(f"- 다음 신청 기간 체크 (학기 초/말)")
-        plan.append(f"")
-        plan.append(f"**2단계: 이수 계획 수립 📝**")
-        plan.append(f"- 학기당 {recommendation['required_credits'] // remaining_semesters + 1}학점씩 이수")
-        plan.append(f"- 전공필수 과목 우선 수강")
-        plan.append(f"")
-        plan.append(f"**3단계: 사전 준비 💪**")
-        plan.append(f"- 해당 전공 교수님 상담 권장")
-        plan.append(f"- 선배들의 이수 경험 참고")
-    
-    elif feasibility == "보통":
-        plan.append(f"**1단계: 신중한 검토 필요 🤔**")
-        plan.append(f"- 본전공 학점 이수 계획 먼저 확정")
-        plan.append(f"- 학기당 수강 가능 학점 현실적으로 계산")
-        plan.append(f"")
-        plan.append(f"**2단계: 대안 고려 ⚖️**")
-        plan.append(f"- 더 낮은 학점의 제도(부전공, 마이크로디그리) 검토")
-        plan.append(f"- 계절학기 활용 가능성 확인")
-        plan.append(f"")
-        plan.append(f"**3단계: 상담 필수 📞**")
-        plan.append(f"- 학사지원팀 상담으로 정확한 이수 가능성 확인")
-        plan.append(f"- 지도교수님과 졸업 계획 논의")
-    
-    else:
-        plan.append(f"**1단계: 현실적인 대안 검토 🔄**")
-        plan.append(f"- 부전공(21학점) 또는 마이크로디그리(12~18학점) 추천")
-        plan.append(f"- 졸업 후 추가 학기 고려 여부 판단")
-        plan.append(f"")
-        plan.append(f"**2단계: 학점 확보 전략 📚**")
-        plan.append(f"- 계절학기 필수 활용")
-        plan.append(f"- 학점 교류/교환학생 프로그램 검토")
-        plan.append(f"")
-        plan.append(f"**3단계: 전문가 상담 필수 ⚠️**")
-        plan.append(f"- 학사지원팀에서 정확한 이수 가능성 확인")
-        plan.append(f"- 다른 역량 개발 방안도 함께 논의")
-    
-    return "\n".join(plan)
 
 # === 챗봇 응답 생성 ===
 def generate_response(user_input):
@@ -1083,7 +1136,7 @@ def generate_response(user_input):
     
     # 1. 인사
     if any(x in user_input_lower for x in ["안녕", "하이", "hello", "반가"]):
-        return "안녕하세요! 👋 유연학사제도 안내 챗봇입니다. 궁금한 전공이나 제도를 물어보세요!", "greeting"
+        return "안녕하세요! 👋 유연학사제도(다전공) 안내 AI챗봇입니다. 궁금한 전공이나 제도를 물어보세요!", "greeting"
 
     # ====================================================
     # 2. [통합 검색] 전공/관심분야 검색 (최우선 처리)
@@ -1179,7 +1232,7 @@ def generate_response(user_input):
             response += f"- 졸업인증: {info['graduation_certification']}\n"
             response += f"- 졸업시험: {info['graduation_exam']}\n\n"
             response += f"**✅ 신청자격:** {info['qualification']}\n"
-            response += f"**📜 학위표기:** {info['degree']}\n"
+            response += f"**📜 학위기 표기:** {info['degree']}\n"
             response += f"**♧ 난이도:** {info['difficulty']}\n\n"
             
             if info['features']:
@@ -1270,794 +1323,344 @@ def generate_response(user_input):
     # 완전 매칭 실패
     return "죄송합니다. 질문을 이해하지 못했습니다. 😅\n'경영'이나 '복수전공'처럼 핵심 단어로 질문해 보시겠어요?", "no_match"
 
-# === 사이드바 ===
-with st.sidebar:
+# === 메인 UI ===
+def main():
+    # 1. 데이터 로드
+    ALL_DATA = load_all_data()
+
     st.title("🎓 한경국립대 유연학사제도(다전공) 안내")
     
-    # 관리자 모드 토글
-    with st.expander("🔐 관리자 모드"):
-        if not st.session_state.is_admin:
-            admin_password = st.text_input("비밀번호", type="password", key="admin_login")
-            if st.button("로그인"):
-                if admin_password == ADMIN_PASSWORD:
-                    st.session_state.is_admin = True
-                    st.success("✅ 관리자 로그인 성공!")
-                    st.rerun()
-                else:
-                    st.error("❌ 비밀번호가 틀렸습니다.")
-        else:
-            st.success("✅ 관리자 모드 활성화")
-            if st.button("로그아웃"):
-                st.session_state.is_admin = False
-                st.rerun()
-    
-    st.divider()
-    
-    # 메뉴 선택
-    if st.session_state.is_admin:
-        menu = st.radio(
-            "메뉴 선택",
-            ["💬 챗봇", "📚 다전공 제도 안내", "❓ FAQ", "🔑 키워드 관리", "📊 피드백 통계"]
+    # === 사이드바 설정 ===
+    with st.sidebar:
+        st.markdown(
+            """
+            <div style='text-align: center; padding: 10px 0;'>
+                <h1 style='font-size: 3rem; margin-bottom: 0;'>🎓</h1>
+                <h3 style='margin-top: 0;'>HKNU 다전공 제도 안내</h3>
+            </div>
+            """, 
+            unsafe_allow_html=True
         )
-    else:
-        menu = st.radio(
-            "메뉴 선택",
-            ["💬 챗봇", "📚 다전공 제도 안내", "❓ FAQ"]
+        
+        menu = option_menu(
+            menu_title=None,
+            options=["AI챗봇 상담", "다전공 제도 안내", "FAQ"], 
+            icons=["chat-dots-fill", "journal-bookmark-fill", "question-circle-fill"],
+            menu_icon="cast",
+            default_index=0,
+            styles={
+                "container": {"padding": "0!important", "background-color": "#fafafa"},
+                "icon": {"color": "orange", "font-size": "18px"}, 
+                "nav-link": {"font-size": "16px", "text-align": "left", "margin":"0px", "--hover-color": "#eee"},
+                "nav-link-selected": {"background-color": "#0091FF"},
+            }
         )
-    
-    st.divider()
-    
-    st.subheader("빠른 질문")
-    quick_questions = [
-        "복수전공이 뭐야?",
-        "부전공 학점은?",
-        "신청은 언제 해?",
-        "제도 비교해줘"
-    ]
-    
-    for i, q in enumerate(quick_questions):
-        if st.button(q, key=f"quick_q_{i}"):
-            st.session_state.chat_history.append(
-                {"role": "user", "content": q}
+
+        st.divider()
+
+        with st.container(border=True):
+            st.markdown("### 🤖 다전공 안내 AI챗봇")
+            st.caption("Powered by Gemini 2.0")
+            st.info(
+                """
+                **AI챗봇이 여러분의 다전공 고민을
+                해결해 드립니다.
+                
+                *"경영학과 졸업요건은?"*
+                *"복수전공 신청 기간은?"*
+                
+                무엇이든 물어보세요!
+                """
             )
-            response, response_type = generate_response(q)
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": response,
-                "response_type": response_type
-            })
-            st.session_state.scroll_to_bottom = True
-            st.session_state.scroll_count += 1
-            st.rerun()
-    
-    st.divider()
-    st.caption(f"📁 로드된 제도: {len(PROGRAM_INFO)}개")
-    st.caption(f"📁 로드된 FAQ: {len(FAQ_DATA)}개")
-    
-    if st.session_state.is_admin:
-        st.caption(f"🔍 로드된 키워드: {len(KEYWORDS_DATA)}개")
-        st.caption(f"💬 피드백 수: {len(st.session_state.feedback_data)}개")
 
-# === 메인 콘텐츠 ===
-st.title("🎓 유연학사제도(다전공) 안내 챗봇")
-
-if menu == "💬 챗봇":
-    # --- 상단 질문 예시 가이드 ---
-    st.markdown("### 💡 이런 식으로 질문해 보세요!")
-
-    # 추천 질문 리스트 (AI의 강점을 보여줄 수 있는 질문들)
-    example_questions = [
-        "행정학전공 2학년 과목 추천해줘",
-        "복수전공과 부전공의 차이점은?",
-        "융합전공에는 어떤 전공이 있어?", # AI가 리스트를 긁어오도록 유도
-        "다전공 신청 기간과 방법 알려줘",
-        "경영학전공 사무실 연락처랑 위치 어디야?", # 구체적인 예시로 변경
-        "복수전공 신청 시 졸업 이수 학점 변화는?"
-    ]
-
-    cols = st.columns(3)    
-    for idx, question in enumerate(example_questions):
-        with cols[idx % 3]:
-            # 말풍선 모양처럼 보이도록 스타일링된 버튼
-            if st.button(f"💬 {question}", key=f"ex_q_{idx}", use_container_width=True):
-                # 버튼 클릭 시 해당 질문을 채팅창에 입력한 것과 동일하게 작동
-                st.session_state.chat_history.append({"role": "user", "content": question})
-                
-                with st.spinner("AI 상담원이 답변을 준비 중입니다..."):
-                    try:
-                        ai_response, res_type = generate_ai_response(question, st.session_state.chat_history[:-1])
-                        if res_type == "error":
-                            raise Exception(ai_response)
-                    except Exception as e:
-                        # AI 실패 시 기존 검색 로직으로 작동
-                        ai_response, res_type = generate_response(question)
-                        ai_response = f"⚠️ (AI 모드 일시 오류: {str(e)[:30]})\n\n" + ai_response
-
-                st.session_state.chat_history.append({
-                    "role": "assistant", 
-                    "content": ai_response,
-                    "response_type": res_type
-                })
-                st.rerun()
-
-    st.divider()
-    
-    # 졸업학점 계산기 버튼 추가
-    col_calc1, col_calc2 = st.columns([3, 1])
-    with col_calc1:
-        st.write("**💡 나에게 맞는 다전공을 찾고 싶다면?**")
-    with col_calc2:
-        if st.button("🧮 졸업학점 계산하기", type="primary", use_container_width=True):
-            st.session_state.show_calculator = not st.session_state.show_calculator
-            st.rerun()
-    
-    # 계산기 폼 표시
-    if st.session_state.show_calculator:
-        with st.container():
-            st.markdown("---")
-            st.subheader("📝 기본 정보 입력")
-            st.write("현재 상태를 입력하면 맞춤형 다전공을 추천해드립니다!")
+        with st.container(border=True):
+            st.markdown("### 📚 다전공 제도란?")
+            st.success("주전공 외에 복수, 부, 융합전공 등 다양한 학위를 취득하여 융합형 인재로 성장하는 제도입니다.")
             
-            with st.form("credit_calculator_form"):
-                col1, col2 = st.columns(2)
-                
+        st.markdown("---")
+        st.caption("ⓒ 학사지원팀 031-670-5035")
+
+
+    # === 메인 콘텐츠 영역 ===
+    
+    if menu == "AI챗봇 상담":
+        st.subheader("💬 AI 상담원과 대화하기")
+
+        # [복원됨] 👋 상단 질문 예시 가이드
+        with st.expander("💡 어떤 질문을 해야 할지 모르겠나요? (클릭)", expanded=True):
+            st.markdown("궁금한 질문 버튼을 누르면 AI가 바로 답변해 드립니다!")
+            
+            example_questions = [
+                "행정학전공 2학년 과목 추천해줘",
+                "복수전공과 부전공의 차이점은?",
+                "융합전공에는 어떤 전공이 있어?", 
+                "다전공 신청 기간과 방법 알려줘",
+                "경영학전공 사무실 연락처랑 위치 어디야?", 
+                "복수전공 신청 시 졸업 이수 학점 변화는?"
+            ]
+
+            # 2단 그리드로 버튼 배치
+            cols = st.columns(2)
+            for idx, question in enumerate(example_questions):
+                if cols[idx % 2].button(f"💬 {question}", use_container_width=True):
+                    # 버튼 클릭 시 동작 로직
+                    st.session_state.chat_history.append({"role": "user", "content": question})
+                    
+                    with st.spinner("AI가 답변을 생성 중입니다..."):
+                        response_text, res_type = generate_ai_response(
+                            question, 
+                            st.session_state.chat_history[:-1], 
+                            ALL_DATA
+                        )
+                    
+                    st.session_state.chat_history.append({
+                        "role": "assistant", 
+                        "content": response_text, 
+                        "response_type": res_type
+                    })
+                    st.rerun()  # 화면 새로고침하여 답변 즉시 표시
+
+        st.divider()
+        
+        # 채팅 기록 표시
+        for chat in st.session_state.chat_history:
+            role = "user" if chat["role"] == "user" else "assistant"
+            avatar = "🧑‍🎓" if role == "user" else "🤖"
+            with st.chat_message(role, avatar=avatar):
+                st.markdown(chat["content"])
+        
+        # 입력창
+        if prompt := st.chat_input("질문을 입력하세요..."):
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            with st.chat_message("user", avatar="🧑‍🎓"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant", avatar="🤖"):
+                with st.spinner("AI가 답변을 생성 중입니다..."):
+                    response_text, res_type = generate_ai_response(
+                        prompt, 
+                        st.session_state.chat_history[:-1], 
+                        ALL_DATA
+                    )
+                    st.markdown(response_text)
+                    
+            st.session_state.chat_history.append({"role": "assistant", "content": response_text, "response_type": res_type})
+            scroll_to_bottom()
+
+    # === [화면 2] 다전공 제도 안내 ===
+    elif menu == "다전공 제도 안내":
+        st.header("📊 제도 한눈에 비교")
+
+        # 1. 상단 카드형 UI
+        if 'programs' in ALL_DATA and ALL_DATA['programs']:
+            cols = st.columns(3)
+            for idx, (program, info) in enumerate(ALL_DATA['programs'].items()):
+                with cols[idx % 3]:
+                    desc = info.get('description', '설명 없음')
+                    c_pri = info.get('credits_primary', '-')
+                    c_mul = info.get('credits_multi', '-')
+                    degree = info.get('degree', '-')
+                    difficulty = info.get('difficulty', '⭐')
+                    
+                    long_text_style = "overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.4;"
+
+                    html_content = f"""
+                    <div style="border: 1px solid #e5e7eb; border-radius: 14px; padding: 18px; background: white; box-shadow: 0 4px 6px rgba(0,0,0,0.05); min-height: 380px; margin-bottom: 20px; display: flex; flex-direction: column; justify-content: space-between;">
+                        <div>
+                            <h3 style="margin: 0 0 8px 0; color: #1f2937; font-size: 1.2rem;">🎓 {program}</h3>
+                            <p style="color: #6b7280; font-size: 14px; margin-bottom: 12px; {long_text_style}">{desc}</p>
+                            <hr style="margin: 12px 0; border: 0; border-top: 1px solid #e5e7eb;">
+                            <div style="font-size: 14px; margin-bottom: 8px;">
+                                <strong style="color: #374151;">📖 이수 학점</strong>
+                                <ul style="padding-left: 18px; margin: 4px 0; color: #4b5563;">
+                                    <li style="margin-bottom: 4px;"><span style="font-weight:600; color:#374151;">본전공:</span> {c_pri}</li>
+                                    <li><span style="font-weight:600; color:#374151;">다전공:</span> {c_mul}</li>
+                                </ul>
+                            </div>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; align-items: end; margin-top: 10px;">
+                            <div style="max-width: 65%;">
+                                <strong style="color: #374151; font-size: 14px;">📜 학위기</strong><br>
+                                <div style="font-size: 13px; color: #2563eb; background: #eff6ff; padding: 2px 6px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{degree}</div>
+                            </div>
+                            <div style="text-align: right; min-width: 30%;">
+                                <strong style="color: #374151; font-size: 14px;">난이도</strong><br>
+                                <span style="color: #f59e0b; font-size: 16px;">{difficulty}</span>
+                            </div>
+                        </div>
+                    </div>"""
+                    st.markdown(html_content, unsafe_allow_html=True)
+        else:
+            st.error("❌ 제도 데이터를 불러오지 못했습니다.")
+
+        st.divider()
+
+        # 2. 상세 조회 기능
+        st.subheader("🔍 상세 정보 조회")
+        
+        prog_keys = list(ALL_DATA['programs'].keys()) if 'programs' in ALL_DATA else []
+        selected_program = st.selectbox("자세히 알아볼 제도를 선택하세요", prog_keys)
+        
+        if selected_program and 'programs' in ALL_DATA:
+            info = ALL_DATA['programs'][selected_program]
+            
+            # 기본 정보 탭
+            tab1, tab2 = st.tabs(["📝 기본 정보", "✅ 특징 및 유의사항"])
+            with tab1:
+                col1, col2 = st.columns([2, 1])
                 with col1:
+                    st.info(f"**개요**\n\n{info.get('description', '-')}")
+                    st.subheader("📖 이수 학점 상세")
+                    st.markdown(f"""
+                    - **교양:** {info.get('credits_general', '-')}
+                    - **원전공:** {info.get('credits_primary', '-')}
+                    - **다전공:** {info.get('credits_multi', '-')}
+                    """)
+                    st.subheader("🎓 졸업 요건")
+                    st.markdown(f"- **졸업인증:** {info.get('graduation_certification', '-')}")
+                    st.markdown(f"- **졸업시험:** {info.get('graduation_exam', '-')}")
+
+                with col2:
+                    st.success(f"**신청 자격**\n\n{info.get('qualification', '-')}")
+                    st.write(f"**학위기 표기**\n\n{info.get('degree', '-')}")
+            with tab2:
+                for f in info.get('features', []): st.write(f"✔️ {f}")
+                if info.get('notes'): st.warning(f"**💡 유의사항**: {info['notes']}")
+            
+            st.divider()
+
+            # [✨ 복원된 기능] 오리지널 이수 학점 확인 로직
+            
+            # 1) 전공 목록 확보
+            available_majors = set()
+            if 'courses' in ALL_DATA and not ALL_DATA['courses'].empty:
+                # 제도 유형이 포함된 전공 필터링
+                c_df = ALL_DATA['courses']
+                if '제도유형' in c_df.columns:
+                    mask = c_df['제도유형'].astype(str).str.contains(selected_program, na=False)
+                    available_majors.update(c_df[mask]['전공명'].unique())
+
+            if 'curriculum' in ALL_DATA:
+                 curr_df = ALL_DATA['curriculum']
+                 if not curr_df.empty and '제도유형' in curr_df.columns:
+                     mask = curr_df['제도유형'].astype(str).str.contains(selected_program, na=False)
+                     available_majors.update(curr_df[mask]['전공명'].unique())
+
+            # 2) 전공 선택 UI (오리지널 스타일)
+            if available_majors:
+                target_programs = ["복수전공", "부전공", "융합전공", "융합부전공"]
+                
+                if selected_program in target_programs:
+                    col_m1, col_m2 = st.columns(2)
+                    with col_m1:
+                        selected_major = st.selectbox(f"이수하려는 {selected_program}", sorted(list(available_majors)))
+                    with col_m2:
+                        # 본전공 목록 불러오기
+                        all_majors_list = []
+                        if 'primary_req' in ALL_DATA and not ALL_DATA['primary_req'].empty:
+                            all_majors_list = sorted(ALL_DATA['primary_req']['전공명'].unique().tolist())
+                        my_primary_major = st.selectbox("나의 본전공 (제1전공)", ["선택 안 함"] + all_majors_list)
+                else:
+                    selected_major = st.selectbox(f"이수하려는 {selected_program}", sorted(list(available_majors)))
+                    my_primary_major = "선택 안 함"
+
+                # 3) 학점 요건 표시 (오리지널 로직)
+                if selected_program in target_programs:
                     current_year = datetime.now().year
                     admission_year = st.number_input(
-                        "입학연도 (학번)", 
-                        min_value=2020, 
+                        "본인 학번 (입학연도)", 
+                        min_value=2018, 
                         max_value=current_year, 
-                        value=current_year,
-                        help="본인의 입학연도를 입력하세요"
+                        value=current_year
                     )
                     
-                    all_majors = sorted(PRIMARY_REQUIREMENTS['전공명'].unique().tolist()) if not PRIMARY_REQUIREMENTS.empty else []
-                    primary_major = st.selectbox(
-                        "본전공 (제1전공)",
-                        all_majors if all_majors else ["전공 정보 없음"],
-                        help="현재 본인의 본전공을 선택하세요"
-                    )
-                
-                with col2:
-                    current_grade = st.selectbox(
-                        "현재 학년",
-                        [1, 2, 3, 4],
-                        index=1,
-                        help="현재 재학 중인 학년"
-                    )
+                    st.write("")
                     
-                    current_semester = st.radio(
-                        "현재 학기",
-                        [1, 2],
-                        horizontal=True,
-                        help="1학기 또는 2학기"
-                    )
-                
-                col3, col4 = st.columns(2)
-                
-                with col3:
-                    completed_required = st.number_input(
-                        "이수한 전공필수 학점",
-                        min_value=0,
-                        max_value=100,
-                        value=0,
-                        step=3,
-                        help="현재까지 이수한 본전공 필수 학점"
-                    )
-                
-                with col4:
-                    completed_elective = st.number_input(
-                        "이수한 전공선택 학점",
-                        min_value=0,
-                        max_value=100,
-                        value=0,
-                        step=3,
-                        help="현재까지 이수한 본전공 선택 학점"
-                    )
-                
-                submitted = st.form_submit_button("🎯 다전공 추천 받기", use_container_width=True)
-                
-                if submitted:
-                    if not all_majors or primary_major == "전공 정보 없음":
-                        st.error("❌ 본전공 데이터가 없습니다. 관리자에게 문의하세요.")
-                    else:
-                        # 사용자 질문 추가
-                        user_query = f"[졸업학점 계산 요청]\n학번: {admission_year}, 전공: {primary_major}, {current_grade}학년 {current_semester}학기\n전필: {completed_required}학점, 전선: {completed_elective}학점"
-                        st.session_state.chat_history.append({
-                            "role": "user",
-                            "content": user_query
-                        })
+                    col_left, col_right = st.columns(2)
+                    
+                    # 왼쪽: 타겟 전공 요건
+                    with col_left:
+                        st.subheader(f"🎯 {selected_program}({selected_major}) 이수 학점 기준")
                         
-                        # 분석 수행
-                        primary_result = calculate_remaining_credits(
-                            primary_major, 
-                            admission_year, 
-                            completed_required, 
-                            completed_elective
-                        )
-                        
-                        if primary_result is None:
-                            response = f"❌ {primary_major}의 졸업요건 데이터를 찾을 수 없습니다."
-                            st.session_state.chat_history.append({
-                                "role": "assistant",
-                                "content": response,
-                                "response_type": "calculation_error"
-                            })
-                        else:
-                            # 추천 수행
-                            recommendations = recommend_programs(
-                                primary_major,
-                                admission_year,
-                                current_grade,
-                                completed_required,
-                                completed_elective
-                            )
+                        if 'grad_req' in ALL_DATA and not ALL_DATA['grad_req'].empty:
+                            req_data = ALL_DATA['grad_req'][
+                                (ALL_DATA['grad_req']['전공명'] == selected_major) & 
+                                (ALL_DATA['grad_req']['제도유형'].str.contains(selected_program, na=False))
+                            ].copy()
                             
-                            remaining_semesters = 8 - (current_grade * 2 - (2 - current_semester))
+                            req_data['기준학번'] = pd.to_numeric(req_data['기준학번'], errors='coerce')
+                            req_data = req_data.dropna(subset=['기준학번'])
+                            applicable = req_data[req_data['기준학번'] <= admission_year]
                             
-                            # 결과 메시지 생성
-                            response = f"""
-## 📊 현재 상태 분석
-
-- **이수 진행률:** {primary_result['progress']:.1f}%
-- **이수 완료:** {primary_result['completed_total']}학점 / {primary_result['total_required']}학점
-- **남은 학점:** {primary_result['total_remaining']}학점
-- **남은 학기:** {remaining_semesters}학기
-
-**상세 정보:**
-- 전공필수: {primary_result['required_credits']}학점 (남은: {primary_result['remaining_required']}학점)
-- 전공선택: {primary_result['elective_credits']}학점 (남은: {primary_result['remaining_elective']}학점)
-
----
-
-## 🎓 맞춤형 다전공 추천
-"""
-                            
-                            if not recommendations:
-                                response += "\n추천할 수 있는 제도가 없습니다."
+                            if not applicable.empty:
+                                applicable = applicable.sort_values('기준학번', ascending=False)
+                                row = applicable.iloc[0]
+                                
+                                st.write(f"- 전공필수: **{int(row['전공필수'])}**학점")
+                                st.write(f"- 전공선택: **{int(row['전공선택'])}**학점")
+                                st.markdown(f"#### 👉 {selected_program} {int(row['총학점'])}학점")
                             else:
-                                # 가능성별로 그룹화
-                                high_rec = [r for r in recommendations if r['feasibility'] == "높음"]
-                                medium_rec = [r for r in recommendations if r['feasibility'] == "보통"]
-                                low_rec = [r for r in recommendations if r['feasibility'] in ["낮음", "매우 낮음"]]
-                                
-                                # 높은 가능성
-                                if high_rec:
-                                    response += "\n### 🟢 추천 (높은 가능성)\n\n"
-                                    for idx, rec in enumerate(high_rec[:3], 1):
-                                        response += f"**{idx}. {rec['program']}** (난이도: {'★' * rec['difficulty']}{'☆' * (5 - rec['difficulty'])})\n"
-                                        response += f"- 필요 학점: {rec['required_credits']}학점"
-                                        if rec['additional_primary_credits'] > 0:
-                                            response += f" (본전공 +{rec['additional_primary_credits']}학점)"
-                                        response += f"\n- 여유 학점: {rec['net_available']}학점\n"
-                                        response += f"- 판단 이유:\n"
-                                        for reason in rec['reasons']:
-                                            response += f"  {reason}\n"
-                                        response += f"\n**액션 플랜:**\n"
-                                        action_plan = generate_action_plan(rec, current_grade, remaining_semesters)
-                                        response += action_plan + "\n\n"
-                                
-                                # 보통
-                                if medium_rec:
-                                    response += "\n### 🟡 고려 가능 (보통)\n\n"
-                                    for idx, rec in enumerate(medium_rec[:2], 1):
-                                        response += f"**{idx}. {rec['program']}** (난이도: {'★' * rec['difficulty']}{'☆' * (5 - rec['difficulty'])})\n"
-                                        response += f"- 필요 학점: {rec['required_credits']}학점"
-                                        if rec['additional_primary_credits'] > 0:
-                                            response += f" (본전공 +{rec['additional_primary_credits']}학점)"
-                                        response += f"\n- 여유 학점: {rec['net_available']}학점\n"
-                                        response += f"- 판단 이유:\n"
-                                        for reason in rec['reasons']:
-                                            response += f"  {reason}\n"
-                                        response += "\n"
-                                
-                                # 낮음
-                                if low_rec and not high_rec and not medium_rec:
-                                    response += "\n### 🔴 신중 검토 필요 (낮음)\n\n"
-                                    for idx, rec in enumerate(low_rec[:2], 1):
-                                        response += f"**{idx}. {rec['program']}**\n"
-                                        response += f"- 필요 학점: {rec['total_needed']}학점, 여유: {rec['net_available']}학점\n"
-                                        for reason in rec['reasons']:
-                                            response += f"  {reason}\n"
-                                        response += "\n"
-                                
-                                # 종합 조언
-                                response += "\n---\n\n## 💬 종합 조언\n\n"
-                                
-                                if high_rec:
-                                    response += f"""
-**🎉 좋은 소식입니다!**
-
-현재 상태에서 {len(high_rec)}개의 제도를 무리 없이 이수할 수 있습니다.
-
-**다음 단계:**
-1. 관심 있는 다전공 제도 확인 ('📚 다전공  제도 안내' 메뉴)
-2. 해당 전공 사무실 또는 학사지원팀 상담(챗봇에서 전공 검색)
-3. 다전공제도 신청 기간(학기별)에 맞춰 신청서 제출
-"""
-                                elif medium_rec:
-                                    response += f"""
-**🤔 신중한 계획이 필요합니다**
-
-{len(medium_rec)}개의 제도가 가능하지만, 학기당 이수 학점을 높여야 합니다.
-**{medium_rec[0]['program']}**을(를) 고려해보세요.
-
-**권장 사항:**
-1. 본전공 학점 이수 계획 먼저 확정
-2. 계절학기 활용 계획 수립
-3. 학사지원팀에서 정확한 이수 가능성 확인
-"""
-                                else:
-                                    response += """
-**⚠️ 현실적인 대안을 고려하세요**
-
-현재 상태에서는 학점 부담이 높은 제도보다는
-**부전공(21학점)** 또는 **마이크로디그리(12~18학점)**를 추천드립니다.
-
-**대안:**
-1. 낮은 학점의 제도 선택
-2. 계절학기 적극 활용
-3. 졸업 후 추가 학기 고려
-4. 전문가 상담 필수
-"""
-                                
-                                response += "\n\n📞 **문의:** 학사지원팀 (031-670-5035)"
-                            
-                            st.session_state.chat_history.append({
-                                "role": "assistant",
-                                "content": response,
-                                "response_type": "calculation_result"
-                            })
-                        
-                        st.session_state.show_calculator = False
-                        st.session_state.scroll_to_bottom = True
-                        st.session_state.scroll_count += 1
-                        st.rerun()
-            
-            st.markdown("---")
-    
-    st.divider()
-    
-    # 채팅 히스토리 표시
-    for idx, chat in enumerate(st.session_state.chat_history):
-        if chat["role"] == "user":
-            with st.chat_message("user"):
-                st.write(chat["content"])
-        else:
-            with st.chat_message("assistant"):
-                st.markdown(chat["content"])
-                
-                # 피드백 버튼
-                if chat.get("response_type") in ["faq", "program", "comparison", "credits", "application", "graduation", "calculation_result"]:
-                    feedback_key = f"feedback_{idx}"
-                    
-                    if feedback_key not in st.session_state.show_feedback:
-                        col1, col2, col3 = st.columns([1, 1, 8])
-                        
-                        with col1:
-                            if st.button("👍 도움됨", key=f"helpful_{idx}"):
-                                st.session_state.feedback_data.append({
-                                    "question": st.session_state.chat_history[idx-1]["content"],
-                                    "answer": chat["content"],
-                                    "feedback": "helpful",
-                                    "timestamp": datetime.now()
-                                })
-                                st.session_state.show_feedback[feedback_key] = "helpful"
-                                st.rerun()
-                        
-                        with col2:
-                            if st.button("👎 아님", key=f"not_helpful_{idx}"):
-                                st.session_state.feedback_data.append({
-                                    "question": st.session_state.chat_history[idx-1]["content"],
-                                    "answer": chat["content"],
-                                    "feedback": "not_helpful",
-                                    "timestamp": datetime.now()
-                                })
-                                st.session_state.show_feedback[feedback_key] = "not_helpful"
-                                st.rerun()
-                    
-                    elif st.session_state.show_feedback[feedback_key] == "helpful":
-                        st.success("✅ 피드백 감사합니다!")
-                    elif st.session_state.show_feedback[feedback_key] == "not_helpful":
-                        st.info("📝 피드백 감사합니다. 더 나은 답변을 위해 노력하겠습니다!")
-
-    # 사용자 입력
-    # 챗봇 입력창 부분
-user_input = st.chat_input("메시지를 입력하세요...")
-
-if user_input:
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
-    
-    with st.spinner("AI가 응답을 생성 중입니다..."):
-        # 1. AI 응답을 시도합니다.
-        ai_response, res_type = generate_ai_response(user_input, st.session_state.chat_history[:-1])
-        
-        # [중요] 만약 에러가 발생했다면, 화면에 빨간색으로 에러를 다 보여줍니다.
-        if res_type == "error":
-            st.error(f"❌ AI가 작동하지 않는 진짜 이유: {ai_response}")
-            # 여기서 멈춥니다. 아래 fallback 로직으로 넘어가지 않게 합니다.
-            st.stop() 
-
-    # 에러가 없을 때만 정상적으로 채팅 기록에 추가합니다.
-    st.session_state.chat_history.append({
-        "role": "assistant", 
-        "content": ai_response,
-        "response_type": res_type
-    })
-    st.rerun()
-
-    # 스크롤 로직
-    if st.session_state.scroll_to_bottom:
-        scroll_to_bottom()
-        st.session_state.scroll_to_bottom = False
-
-elif menu == "📚 다전공 제도 안내":
-    
-    st.header("📊 제도 한눈에 비교")
-
-    # 3열 그리드 생성
-    cols = st.columns(3)
-
-    for idx, (program, info) in enumerate(PROGRAM_INFO.items()):
-        with cols[idx % 3]:
-            # 데이터 가져오기
-            desc = info.get('description', '설명 없음')
-            c_pri = info.get('credits_primary', '-')
-            c_mul = info.get('credits_multi', '-')
-            
-            # 졸업인증/시험 여부
-            cert_val = str(info.get('graduation_certification', '-'))
-            exam_val = str(info.get('graduation_exam', '-'))
-            grad_cert = info.get('graduation_certification', '-')
-            grad_exam = info.get('graduation_exam', '-')
-            
-            degree = info.get('degree', '-')
-            difficulty = info.get('difficulty', '⭐')
-
-            # 스타일 정의 (한 줄로 유지)
-            long_text_style = "overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.4;"
-
-            # [핵심 수정] HTML 코드를 왼쪽 벽(시작점)에 딱 붙여서 작성했습니다.
-            # 이렇게 해야 마크다운이 '코드 블록'으로 오해하지 않고 정상적으로 렌더링합니다.
-            html_content = f"""
-<div style="border: 1px solid #e5e7eb; border-radius: 14px; padding: 18px; background: white; box-shadow: 0 4px 6px rgba(0,0,0,0.05); min-height: 380px; margin-bottom: 20px; display: flex; flex-direction: column; justify-content: space-between;">
-    <div>
-        <h3 style="margin: 0 0 8px 0; color: #1f2937; font-size: 1.2rem;">🎓 {program}</h3>
-        <p style="color: #6b7280; font-size: 14px; margin-bottom: 12px; {long_text_style}">{desc}</p>
-        <hr style="margin: 12px 0; border: 0; border-top: 1px solid #e5e7eb;">
-        <div style="font-size: 14px; margin-bottom: 8px;">
-            <strong style="color: #374151;">📖 이수 학점</strong>
-            <ul style="padding-left: 18px; margin: 4px 0; color: #4b5563;">
-                <li style="margin-bottom: 4px; {long_text_style}"><span style="font-weight:600; color:#374151;">본전공:</span> {c_pri}</li>
-                <li style="{long_text_style}"><span style="font-weight:600; color:#374151;">다전공:</span> {c_mul}</li>
-            </ul>
-        </div>
-        <div style="font-size: 14px; margin-bottom: 12px;">
-            <strong style="color: #374151;">🎓 졸업 요건</strong>
-            <ul style="padding-left: 18px; margin: 4px 0; color: #4b5563;">
-                <li>졸업인증: {grad_cert}</li>
-                <li>졸업시험: {grad_exam}</li>
-            </ul>
-        </div>
-    </div>
-    <div style="display: flex; justify-content: space-between; align-items: end; margin-top: 10px;">
-        <div style="max-width: 65%;">
-            <strong style="color: #374151; font-size: 14px;">📜 학위</strong><br>
-            <div style="font-size: 13px; color: #2563eb; background: #eff6ff; padding: 2px 6px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{degree}</div>
-        </div>
-        <div style="text-align: right; min-width: 30%;">
-            <strong style="color: #374151; font-size: 14px;">난이도</strong><br>
-            <span style="color: #f59e0b; font-size: 16px;">{difficulty}</span>
-        </div>
-    </div>
-</div>"""
-
-            st.markdown(html_content, unsafe_allow_html=True)
-
-    st.divider()
-    
-    # === 2. 상세 정보 보기 (기존 기능 복원 및 통합) ===
-    st.header("🔍 상세 제도 안내")
-    
-    selected_program = st.selectbox("자세히 알아볼 제도를 선택하세요", list(PROGRAM_INFO.keys()))
-    
-    if selected_program:
-        info = PROGRAM_INFO[selected_program]
-        
-        # 탭을 사용하여 정보 구조화
-        tab1, tab2 = st.tabs(["📝 기본 정보", "✅ 특징 및 유의사항"])
-        
-        with tab1:
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                st.subheader("개요")
-                st.write(info.get('description', ''))
-                
-                st.subheader("이수 학점 상세")
-                st.markdown(f"""
-                - **교양 필수:** {info.get('credits_general', '-')}
-                - **원전공 필수:** {info.get('credits_primary', '-')}
-                - **다전공 필수:** {info.get('credits_multi', '-')}
-                """)
-                
-                st.subheader("졸업 요건")
-                st.markdown(f"""
-                - **졸업인증:** {info.get('graduation_certification', '-')}
-                - **졸업시험:** {info.get('graduation_exam', '-')}
-                """)
-                
-            with col2:
-                st.info(f"**신청 자격**\n\n{info.get('qualification', '-')}")
-                st.success(f"**학위 표기**\n\n{info.get('degree', '-')}")
-                st.metric(f"**✨ 난이도**", info['difficulty'])
-
-
-        with tab2:
-            st.subheader("특징")
-            features = info.get('features', [])
-            if features and isinstance(features, list) and len(features) > 0 and features[0] != '':
-                for f in features:
-                    st.write(f"✔️ {f.strip()}")
-            else:
-                st.write("등록된 특징이 없습니다.")
-            
-            if info.get('notes'):
-                st.warning(f"**💡 기타 유의사항:**\n{info['notes']}")
-
-    st.divider()
-      
-    
-    # 전공 목록 가져오기
-    available_majors = set()
-    
-    if not COURSES_DATA.empty:
-        majors_in_courses = COURSES_DATA[
-            COURSES_DATA['제도유형'] == selected_program
-        ]['전공명'].unique().tolist()
-        available_majors.update(majors_in_courses)
-        
-    if not CURRICULUM_MAPPING.empty:
-        majors_in_mapping = CURRICULUM_MAPPING[
-            CURRICULUM_MAPPING['제도유형'] == selected_program
-        ]['전공명'].unique().tolist()
-        available_majors.update(majors_in_mapping)
-    
-    # 전공 선택 및 정보 표시
-    if available_majors:
-        target_programs = ["복수전공", "부전공", "융합전공", "융합부전공"]
-        
-        if selected_program in target_programs:
-            col_m1, col_m2 = st.columns(2)
-            with col_m1:
-                selected_major = st.selectbox(f"이수하려는 {selected_program}", sorted(list(available_majors)))
-            with col_m2:
-                all_majors = sorted(PRIMARY_REQUIREMENTS['전공명'].unique().tolist()) if not PRIMARY_REQUIREMENTS.empty else []
-                my_primary_major = st.selectbox("나의 본전공 (제1전공)", ["선택 안 함"] + all_majors)
-        else:
-            selected_major = st.selectbox(f"이수하려는 {selected_program}", sorted(list(available_majors)))
-            my_primary_major = "선택 안 함"
-
-        # 학점 요건 조회
-        if selected_program in target_programs:
-            current_year = datetime.now().year
-            admission_year = st.number_input(
-                "본인 학번 (입학연도)", 
-                min_value=2020, 
-                max_value=current_year, 
-                value=current_year
-            )
-            
-            st.write("")
-            
-            col_left, col_right = st.columns(2)
-            
-            with col_left:
-                st.subheader(f"🎯 {selected_program}({selected_major}) 이수 학점 기준")
-                
-                if not GRAD_REQUIREMENTS.empty:
-                    req_data = GRAD_REQUIREMENTS[
-                        (GRAD_REQUIREMENTS['전공명'] == selected_major) & 
-                        (GRAD_REQUIREMENTS['제도유형'] == selected_program)
-                    ].copy()
-                    
-                    req_data['기준학번'] = pd.to_numeric(req_data['기준학번'], errors='coerce')
-                    req_data = req_data.dropna(subset=['기준학번'])
-                    applicable = req_data[req_data['기준학번'] <= admission_year]
-                    
-                    if not applicable.empty:
-                        applicable = applicable.sort_values('기준학번', ascending=False)
-                        row = applicable.iloc[0]
-                        
-                        st.write(f"- 전공필수: **{int(row['전공필수'])}**학점")
-                        st.write(f"- 전공선택: **{int(row['전공선택'])}**학점")
-                        st.markdown(f"#### 👉 {selected_program} {int(row['총학점'])}학점 이수")
-                    else:
-                        st.warning(f"{admission_year}학번 기준 데이터가 없습니다.")
-                else:
-                    st.warning("졸업요건 파일이 없습니다.")
-
-            with col_right:
-                st.subheader(f"🏠 본전공({my_primary_major}) 이수 학점 기준")
-                
-                if my_primary_major != "선택 안 함" and not PRIMARY_REQUIREMENTS.empty:
-                    pri_data = PRIMARY_REQUIREMENTS[PRIMARY_REQUIREMENTS['전공명'] == my_primary_major].copy()
-                    pri_data['기준학번'] = pd.to_numeric(pri_data['기준학번'], errors='coerce')
-                    pri_valid = pri_data[pri_data['기준학번'] <= admission_year]
-                    
-                    if not pri_valid.empty:
-                        matched_row = None
-                        pri_valid = pri_valid.sort_values('기준학번', ascending=False)
-                        
-                        for _, p_row in pri_valid.iterrows():
-                            if selected_program in str(p_row['구분']):
-                                matched_row = p_row
-                                break
-                        
-                        if matched_row is not None:
-                            st.write(f"- 본전공 전필: **{int(matched_row['본전공_전필'])}**학점")
-                            st.write(f"- 본전공 전선: **{int(matched_row['본전공_전선'])}**학점")
-                            st.markdown(f"#### 👉 본전공 {int(matched_row['본전공_계'])}학점 이수")
-                            
-                            if pd.notna(matched_row.get('비고')):
-                                st.caption(f"참고: {matched_row['비고']}")
+                                st.warning(f"{admission_year}학번 기준 데이터가 없습니다.")
                         else:
-                            st.info(f"변동 데이터가 없습니다.")
-                    else:
-                        st.warning(f"{admission_year}학번 기준 데이터가 없습니다.")
-                elif my_primary_major == "선택 안 함":
-                    st.info("본전공을 선택하면 변동된 이수 학점을 확인할 수 있습니다.")
+                            st.warning("졸업요건 데이터가 없습니다.")
 
-        st.divider()
+                    # 오른쪽: 본전공 변동 요건
+                    with col_right:
+                        st.subheader(f"🏠 본전공({my_primary_major}) 이수 학점 기준")
+                        
+                        if my_primary_major != "선택 안 함" and 'primary_req' in ALL_DATA:
+                            pri_data = ALL_DATA['primary_req'][ALL_DATA['primary_req']['전공명'] == my_primary_major].copy()
+                            
+                            if not pri_data.empty:
+                                pri_data['기준학번'] = pd.to_numeric(pri_data['기준학번'], errors='coerce')
+                                pri_valid = pri_data[pri_data['기준학번'] <= admission_year]
+                                
+                                if not pri_valid.empty:
+                                    matched_row = None
+                                    pri_valid = pri_valid.sort_values('기준학번', ascending=False)
+                                    
+                                    for _, p_row in pri_valid.iterrows():
+                                        if selected_program in str(p_row['구분']):
+                                            matched_row = p_row
+                                            break
+                                    
+                                    if matched_row is not None:
+                                        st.write(f"- 본전공 전필: **{int(matched_row['본전공_전필'])}**학점")
+                                        st.write(f"- 본전공 전선: **{int(matched_row['본전공_전선'])}**학점")
+                                        st.markdown(f"#### 👉 본전공 {int(matched_row['본전공_계'])}학점으로 변경")
+                                        
+                                        if pd.notna(matched_row.get('비고')):
+                                            st.caption(f"참고: {matched_row['비고']}")
+                                    else:
+                                        st.info(f"변동 데이터가 없습니다. (단일전공 기준 유지 가능성)")
+                                else:
+                                    st.warning(f"{admission_year}학번 기준 데이터가 없습니다.")
+                            else:
+                                st.warning("본전공 데이터를 찾을 수 없습니다.")
+                        elif my_primary_major == "선택 안 함":
+                            st.info("본전공을 선택하면 변동된 이수 학점을 확인할 수 있습니다.")
 
-        # 이미지 표시
-        if selected_program == "융합전공" or "소단위전공" in selected_program:
-            title = "📋 이수체계도" if selected_program == "융합전공" else "🖼️ 과정 안내 이미지"
-            st.subheader(title)
-            display_curriculum_image(selected_major, selected_program)
+                st.divider()
+
+                # 이미지 표시
+                if selected_program == "융합전공" or "소단위전공" in selected_program:
+                    title = "📋 이수체계도" if selected_program == "융합전공" else "🖼️ 과정 안내 이미지"
+                    st.subheader(title)
+                    display_curriculum_image(selected_major, selected_program)
         
-        # 이수 과목 표시
-        if not COURSES_DATA.empty:
-            display_courses(selected_major, selected_program)
+                # 이수 과목 표시
+                if not COURSES_DATA.empty:
+                    display_courses(selected_major, selected_program)
 
-elif menu == "❓ FAQ":
-    st.header("자주 묻는 질문 (FAQ)")
-    
-    categories = list(set([faq["카테고리"] for faq in FAQ_DATA]))
-    selected_category = st.selectbox("카테고리 선택", ["전체"] + categories)
-    
-    filtered_faqs = FAQ_DATA if selected_category == "전체" else [faq for faq in FAQ_DATA if faq["카테고리"] == selected_category]
-    
-    for i, faq in enumerate(filtered_faqs):
-        with st.expander(f"Q. {faq['질문']}"):
-            st.write(f"**A.** {faq['답변']}")
-            st.caption(f"카테고리: {faq['카테고리']}")
-            
-
-elif menu == "🔑 키워드 관리":
-    st.header("키워드 관리 (관리자 전용)")
-    st.write("등록된 키워드를 확인하고 검색 테스트를 해보세요.")
-    
-    st.subheader("🔍 키워드 검색 테스트")
-    test_input = st.text_input("테스트할 문장을 입력하세요", placeholder="예: 복전 학점은?")
-    
-    if test_input:
-        keyword_match = search_by_keyword(test_input)
-        if keyword_match:
-            st.success(f"✅ 키워드 매칭 성공!")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("매칭된 키워드", keyword_match['키워드'])
-            with col2:
-                st.metric("타입", keyword_match['타입'])
-            with col3:
-                st.metric("연결정보", keyword_match['연결정보'])
+    # === [화면 3] FAQ ===
+    elif menu == "FAQ":
+        st.header("❓ 자주 묻는 질문")
+        if 'faq' in ALL_DATA and ALL_DATA['faq']:
+            for faq in ALL_DATA['faq']:
+                with st.expander(f"Q. {faq['질문']}"):
+                    st.write(f"A. {faq['답변']}")
         else:
-            st.warning("❌ 매칭되는 키워드가 없습니다. 유사도 검색으로 진행됩니다.")
-    
-    st.divider()
-    
-    st.subheader("📋 등록된 키워드 목록")
-    
-    if KEYWORDS_DATA:
-        keyword_types = list(set([k['타입'] for k in KEYWORDS_DATA]))
-        selected_type = st.selectbox("타입 필터", ["전체"] + keyword_types)
-        
-        if selected_type == "전체":
-            filtered_keywords = KEYWORDS_DATA
-        else:
-            filtered_keywords = [k for k in KEYWORDS_DATA if k['타입'] == selected_type]
-        
-        keyword_df = pd.DataFrame(filtered_keywords)
-        st.dataframe(
-            keyword_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "키워드": st.column_config.TextColumn("키워드", width="medium"),
-                "타입": st.column_config.TextColumn("타입", width="small"),
-                "연결정보": st.column_config.TextColumn("연결정보", width="medium")
-            }
-        )
-        
-        st.divider()
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("총 키워드 수", len(KEYWORDS_DATA))
-        with col2:
-            program_keywords = [k for k in KEYWORDS_DATA if k['타입'] == '제도']
-            st.metric("제도 키워드", len(program_keywords))
-        with col3:
-            topic_keywords = [k for k in KEYWORDS_DATA if k['타입'] == '주제']
-            st.metric("주제 키워드", len(topic_keywords))
-        
-        st.info("""
-💡 **키워드 추가 방법**
-1. `data/keywords.xlsx` 파일 열기
-2. 새로운 행 추가 (키워드, 타입, 연결정보)
-3. 파일 저장 후 앱 새로고침
+            st.info("등록된 FAQ가 없습니다.")
 
-**타입 종류:**
-- `제도`: 특정 제도로 연결
-- `주제`: 주제별 정보로 연결
-        """)
-    else:
-        st.warning("등록된 키워드가 없습니다.")
-
-elif menu == "📊 피드백 통계":
-    st.header("피드백 통계 (관리자 전용)")
-    
-    if st.session_state.feedback_data:
-        feedback_df = pd.DataFrame(st.session_state.feedback_data)
-        
-        st.subheader("📈 전체 통계")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            helpful_count = len(feedback_df[feedback_df['feedback'] == 'helpful'])
-            st.metric("👍 도움됨", helpful_count)
-        
-        with col2:
-            not_helpful_count = len(feedback_df[feedback_df['feedback'] == 'not_helpful'])
-            st.metric("👎 아님", not_helpful_count)
-        
-        with col3:
-            total = len(feedback_df)
-            satisfaction = (helpful_count / total * 100) if total > 0 else 0
-            st.metric("만족도", f"{satisfaction:.1f}%")
-        
-        st.divider()
-        
-        st.subheader("📋 최근 피드백")
-        
-        feedback_filter = st.selectbox(
-            "피드백 타입",
-            ["전체", "도움됨", "아님"]
-        )
-        
-        if feedback_filter == "도움됨":
-            filtered_feedback = feedback_df[feedback_df['feedback'] == 'helpful']
-        elif feedback_filter == "아님":
-            filtered_feedback = feedback_df[feedback_df['feedback'] == 'not_helpful']
-        else:
-            filtered_feedback = feedback_df
-        
-        filtered_feedback = filtered_feedback.sort_values('timestamp', ascending=False)
-        
-        st.dataframe(
-            filtered_feedback[['question', 'feedback', 'timestamp']],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "question": st.column_config.TextColumn("질문", width="large"),
-                "feedback": st.column_config.TextColumn("피드백", width="small"),
-                "timestamp": st.column_config.DatetimeColumn(
-                    "시간",
-                    format="YYYY-MM-DD HH:mm"
-                )
-            }
-        )
-    else:
-        st.info("아직 수집된 피드백이 없습니다.")
-
-st.caption("💡 더 자세한 정보는 학사지원팀(031-670-5035) 또는 전공 사무실에 문의하세요.")
-st.caption(f"마지막 업데이트: {datetime.now().strftime('%Y년 %m월 %d일')}")
+if __name__ == "__main__":
+    main()
