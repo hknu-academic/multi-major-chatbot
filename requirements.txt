@@ -49,6 +49,5 @@ openpyxl
 scikit-learn
 numpy
 google-genai
-google-generativeai
 streamlit-option-menu
 python-dotenv
