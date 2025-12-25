@@ -12,9 +12,10 @@ import uuid
 import re
 
 # === [AI 설정] Gemini API 연결 ===
-
-if "GEMINI_API_KEY" not in st.secrets:
-    st.error("⚠️ GEMINI_API_KEY가 Secrets에 없습니다.")
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    st.error("⚠️ GEMINI_API_KEY가 설정되지 않았습니다!")
+    st.info("Streamlit Secrets에 API 키를 저장해주세요.")
     st.stop()
 
 client = genai.Client(api_key=GEMINI_API_KEY)  # <--- Client 객체 생성 방식으로 변경
